@@ -486,12 +486,42 @@ class CLIInfoMixin:
             self._console_print(f"[bold red]{_escape(str(message))}[/]")
             return True
 
-        exit_code = run_bang_command(
-            command,
-            cwd=resolve_bang_cwd(getattr(self, "session_id", None)),
-            writer=lambda line: self._console_print(_rich_text_from_ansi(line)))
-        if exit_code:
-            self._console_print(f"[dim]! exited {exit_code}[/]")
+        cwd = resolve_bang_cwd(getattr(self, "session_id", None))
+        writer = lambda line: self._console_print(_rich_text_from_ansi(line))
+        # Non-TUI callers (including API-style unit/test doubles) retain the
+        # original synchronous contract; only the live interactive app needs a
+        # worker so prompt_toolkit can repaint the HUD during execution.
+        if not getattr(self, "_app", None):
+            exit_code = run_bang_command(command, cwd=cwd, writer=writer)
+            if exit_code:
+                self._console_print(f"[dim]! exited {exit_code}[/]")
+            return True
+
+        # Keep the prompt_toolkit event loop free while a shell command runs.  The
+        # operator HUD is live-rendered from this loop; running subprocess.run in
+        # the submission callback otherwise freezes the frame and hides PROC state.
+        self._active_bang_processes = getattr(self, "_active_bang_processes", 0) + 1
+
+        def _run() -> None:
+            try:
+                exit_code = run_bang_command(
+                    command,
+                    cwd=cwd,
+                    writer=writer)
+                if exit_code:
+                    self._console_print(f"[dim]! exited {exit_code}[/]")
+            finally:
+                self._active_bang_processes = max(0, getattr(self, "_active_bang_processes", 1) - 1)
+                try:
+                    self._invalidate(min_interval=0.0)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_run, name="hermes-bang-shell", daemon=True).start()
+        try:
+            self._invalidate(min_interval=0.0)
+        except Exception:
+            pass
         return True
 
     def _show_gateway_status(self):

@@ -276,6 +276,10 @@ class CLIStatusBarMixin:
         except Exception:
             pass
         try:
+            snapshot["active_bang_processes"] = int(getattr(self, "_active_bang_processes", 0) or 0)
+        except Exception:
+            pass
+        try:
             from tools.async_delegation import active_count as _async_active_count
             snapshot["active_background_subagents"] = _async_active_count()
         except Exception:
@@ -1198,6 +1202,7 @@ class CLIStatusBarMixin:
             procs = process_registry.count_running()
         except Exception:
             pass
+        procs += int(getattr(self, "_active_bang_processes", 0) or 0)
         try:
             from tools.delegate_tool_registry import list_active_subagents
             agents = len(list_active_subagents())

@@ -147,6 +147,13 @@ def test_counts_only_running_processes_subagents_and_bg_tasks(monkeypatch):
         _unregister_subagent("sa-hudtest")
 
 
+def test_interactive_bang_process_is_rendered_as_proc():
+    cli_obj = _make_cli()
+    cli_obj._active_bang_processes = 1
+    assert cli_obj._operator_activity_labels() == ["⚙ PROC 1"]
+    assert "● RUNNING" in _text(cli_obj._get_operator_hud_fragments(width=120))
+
+
 def test_copy_last_uses_existing_copy_command_and_clipboard_path():
     cli_obj = _make_cli()
     assert not cli_obj._copy_last_available()
