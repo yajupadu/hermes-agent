@@ -157,7 +157,7 @@ def test_interactive_bang_process_is_rendered_as_proc():
 def test_copy_last_uses_existing_copy_command_and_clipboard_path():
     cli_obj = _make_cli()
     assert not cli_obj._copy_last_available()
-    assert "Copy last" not in _text(cli_obj._get_operator_hud_fragments(width=120))
+    assert "Copy last" in _text(cli_obj._get_operator_hud_fragments(width=120))
     with patch.object(HermesCLI, "_handle_copy_command") as copy_cmd:
         cli_obj._tui_handle_copy_last(None)
     copy_cmd.assert_not_called()

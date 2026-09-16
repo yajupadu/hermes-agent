@@ -1233,8 +1233,7 @@ class CLIStatusBarMixin:
         try:
             segs = [[self._operator_state_fragment()]]
             segs += [[(_STRONG, label)] for label in self._operator_activity_labels()]
-            if self._copy_last_available():
-                segs.append([(_DIM, "[⧉ Copy last "), (_STRONG, "Alt+C"), (_DIM, "]")])
+            segs.append([(_DIM, "[⧉ Copy last "), (_STRONG, "Alt+C"), (_DIM, "]")])
             hud = getattr(self, "_quota_hud", None)
             if hud is not None:
                 from agent.quota_hud import compact_quota
