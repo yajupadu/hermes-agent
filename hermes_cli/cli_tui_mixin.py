@@ -390,6 +390,7 @@ class CLITuiMixin:
             getattr(self, "_pet_widget", None),
             getattr(self, "_stash_panel_widget", None),
             getattr(self, "_subagent_dock_widget", None),
+            getattr(self, "_operator_hud_widget", None),
             status_bar,
             input_rule_top,
             image_bar,
@@ -410,6 +411,10 @@ class CLITuiMixin:
             if self._command_running:
                 self._invalidate(min_interval=0.1)
                 time.sleep(0.1)
+            elif self._agent_running:
+                # Keeps the HUD's RUNNING clock ticking through silent API waits.
+                self._invalidate(min_interval=1.0)
+                time.sleep(0.2)
             else:
                 # Never repaint the idle prompt on a timer: in non-full-screen mode background
                 # redraws fight tmux/Ghostty/cmux viewport restoration after focus changes and
@@ -1150,6 +1155,11 @@ class CLITuiMixin:
         Silent when no image (avoid noise on accidental press)."""
         if self._try_attach_clipboard_image():
             event.app.invalidate()
+
+    def _tui_handle_copy_last(self, event):
+        """Alt+C — the HUD Copy last control; exactly ``/copy`` (same clipboard path and message)."""
+        if self._copy_last_available():
+            self._handle_copy_command("/copy")
 
     def _tui_handle_ctrl_v(self, event):
         """Image paste for terminals without bracketed paste: GNOME Terminal/Konsole send raw
@@ -1927,6 +1937,9 @@ class CLITuiMixin:
                 lambda event: open_monitor(self))
         kb.add('f7', filter=Condition(lambda: not modal_prompt_active(self)))(
             lambda event: toggle_dock(self))
+        # HUD "Copy last" control. mouse_support is off (keeps native terminal selection), so it's a key.
+        kb.add('escape', 'c', filter=Condition(lambda: not modal_prompt_active(self)))(
+            self._tui_handle_copy_last)
         return kb
 
     def _tui_bind_editor_and_stash(self, kb) -> None:
@@ -2123,6 +2136,14 @@ class CLITuiMixin:
                 # shutil sizes). _get_status_bar_fragments reads prompt_toolkit's own width, so
                 # this is the belt-and-suspenders guard.
                 wrap_lines=False),
+            filter=Condition(
+                lambda: cli_ref._status_bar_visible
+                and not getattr(cli_ref, "_status_bar_suppressed_after_resize", False)))
+        # Operator HUD — state / running work / copy-last / quota, one row above the status bar.
+        from agent.quota_hud import QuotaHud
+        self._quota_hud = QuotaHud(on_update=lambda: cli_ref._app.invalidate() if getattr(cli_ref, "_app", None) else None)
+        self._operator_hud_widget = ConditionalContainer(
+            Window(content=FormattedTextControl(lambda: cli_ref._get_operator_hud_fragments()), height=1, wrap_lines=False),
             filter=Condition(
                 lambda: cli_ref._status_bar_visible
                 and not getattr(cli_ref, "_status_bar_suppressed_after_resize", False)))

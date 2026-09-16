@@ -201,20 +201,20 @@ def _claude_oauth_record(data: Any, source: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
+def _read_claude_code_credentials_from_keychain(service: str = "Claude Code-credentials") -> Optional[Dict[str, Any]]:
     """Read the "Claude Code-credentials" macOS Keychain entry (Claude Code >=2.1.114)."""
     if platform.system() != "Darwin":
         return None
     try:
         result = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            ["security", "find-generic-password", "-s", service, "-w"],
             capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5, stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired):
         logger.debug("Keychain: security command not available or timed out")
         return None
     if result.returncode != 0:
-        logger.debug("Keychain: no entry found for 'Claude Code-credentials'")
+        logger.debug("Keychain: no entry found for %r", service)
         return None
     raw = result.stdout.strip()
     try:
@@ -246,6 +246,18 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
     if kc_valid != file_valid:
         return kc_creds if kc_valid else file_creds
     return kc_creds if (kc_creds.get("expiresAt", 0) or 0) >= (file_creds.get("expiresAt", 0) or 0) else file_creds
+
+
+def read_claude_code_credentials_for_config_dir(config_dir: Path) -> Optional[Dict[str, Any]]:
+    """Read-only credentials of an isolated ``CLAUDE_CONFIG_DIR`` Claude Code login. Claude Code keys its Keychain
+    entry as ``Claude Code-credentials-<sha256(config_dir)[:8]>`` and falls back to ``<config_dir>/.credentials.json``.
+    Never refreshes: rotating the refresh token here would desync the account's own Claude Code install."""
+    suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+    creds = _read_claude_code_credentials_from_keychain(f"Claude Code-credentials-{suffix}")
+    if creds:
+        return creds
+    data = _load_json_if_exists(config_dir / ".credentials.json", ".credentials.json")
+    return _claude_oauth_record(data, "claude_code_credentials_file") if isinstance(data, dict) else None
 
 
 def is_claude_code_token_valid(creds: Dict[str, Any]) -> bool:

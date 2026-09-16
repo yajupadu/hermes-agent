@@ -675,6 +675,13 @@ class CLIInfoMixin:
         """
         from cli import datetime, format_duration_compact
 
+        # Operator HUD accounts (C1/C2/CX) with reset times — cached values, no network here.
+        hud = getattr(self, "_quota_hud", None)
+        if hud is not None:
+            for line in hud.usage_lines():
+                print(f"  {line}")
+            print()
+
         def _credits_or(fallback: str) -> None:
             if self._print_nous_credits_block():
                 self._print_usage_cta()

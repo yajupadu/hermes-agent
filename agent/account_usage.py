@@ -87,6 +87,11 @@ def _format_reset(dt: Optional[datetime]) -> str:
     return f"in {hours}h {minutes}m ({stamp})" if hours else f"in {minutes}m ({stamp})"
 
 
+def remaining_percent(used_percent: float) -> int:
+    """Used % → whole remaining %, clamped to 0..100."""
+    return max(0, min(100, round(100 - float(used_percent))))
+
+
 def render_account_usage_lines(snapshot: Optional[AccountUsageSnapshot], *, markdown: bool = False) -> list[str]:
     if not snapshot:
         return []
@@ -98,7 +103,7 @@ def render_account_usage_lines(snapshot: Optional[AccountUsageSnapshot], *, mark
             base = f"{window.label}: unavailable"
         else:
             used = float(window.used_percent)
-            base = f"{window.label}: {max(0, round(100 - used))}% remaining ({max(0, round(used))}% used)"
+            base = f"{window.label}: {remaining_percent(used)}% remaining ({max(0, round(used))}% used)"
         if window.reset_at:
             base += f" • resets {_format_reset(window.reset_at)}"
         elif window.detail:
@@ -547,9 +552,14 @@ def _fetch_anthropic_account_usage(
     if not _is_oauth_token(token):
         return _snapshot("anthropic", "oauth_usage_api", [], [],
                          unavailable_reason="Anthropic account limits are only available for OAuth-backed Claude accounts.")
+    return fetch_claude_oauth_usage(token)
+
+
+def fetch_claude_oauth_usage(token: str, *, timeout: float = 15.0) -> AccountUsageSnapshot:
+    """Claude subscription limits for one OAuth access token (raises on HTTP/network failure)."""
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json",
                "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0"}
-    payload = _get_json("https://api.anthropic.com/api/oauth/usage", headers, timeout=15.0)
+    payload = _get_json("https://api.anthropic.com/api/oauth/usage", headers, timeout=timeout)
     windows = _usage_windows(
         payload, (("five_hour", "Current session"), ("seven_day", "Current week"), ("seven_day_opus", "Opus week"),
                   ("seven_day_sonnet", "Sonnet week")), "utilization", "resets_at", fraction=True,

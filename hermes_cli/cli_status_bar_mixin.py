@@ -740,16 +740,10 @@ class CLIStatusBarMixin:
         self._pet_event = ""
         from agent.pet.state import derive_pet_state
 
-        # Any blocking modal (approval / clarify / sudo / secret / slash confirm) means the
-        # agent is paused on the user → `waiting`, which outranks the in-flight signals.
-        awaiting_input = bool(
-            self._approval_state
-            or self._clarify_state
-            or self._sudo_state
-            or self._secret_state
-            or getattr(self, "_slash_confirm_state", None))
+        # A blocking modal means the agent is paused on the user → `waiting`, which outranks
+        # the in-flight signals.
         return derive_pet_state(
-            awaiting_input=awaiting_input,
+            awaiting_input=self._awaiting_user_input(),
             busy=getattr(self, "_agent_running", False),
             reasoning=self._pet_reasoning,
         ).value
@@ -1171,6 +1165,93 @@ class CLIStatusBarMixin:
             return frags
         except Exception:
             return [(_SB, f" {self._build_status_bar_text()} ")]
+
+    # ── operator HUD ──────────────────────────────────────────────────────────
+
+    def _awaiting_user_input(self) -> bool:
+        """A blocking modal (approval / clarify / sudo / secret / slash confirm) waits on the user."""
+        return any(getattr(self, name, None) for name in (
+            "_approval_state", "_clarify_state", "_sudo_state", "_secret_state", "_slash_confirm_state"))
+
+    def _operator_state_fragment(self) -> "tuple[str, str]":
+        """``◐ WAITING`` / ``● RUNNING 02:41`` / ``○ IDLE`` from the live turn, modal state, and any
+        active background work (process/subagent/bg-task registries): a running worker means the
+        overall session is RUNNING even while the controller itself is idle between turns."""
+        if self._awaiting_user_input():
+            return ("class:status-bar-warn", "◐ WAITING")
+        agent_running = getattr(self, "_agent_running", False)
+        if not agent_running and not self._operator_activity_labels():
+            return (_DIM, "○ IDLE")
+        start = getattr(self, "_prompt_start_time", None)
+        if start is None:
+            return (_STRONG, "● RUNNING")
+        minutes, seconds = divmod(int(max(0.0, time.time() - start)), 60)
+        hours, minutes = divmod(minutes, 60)
+        clock = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+        return (_STRONG, f"● RUNNING {clock}")
+
+    def _operator_activity_labels(self) -> list:
+        """Non-zero counts of work that is running right now, from the existing registries."""
+        procs = agents = 0
+        try:
+            from tools.process_registry import process_registry
+            procs = process_registry.count_running()
+        except Exception:
+            pass
+        try:
+            from tools.delegate_tool_registry import list_active_subagents
+            agents = len(list_active_subagents())
+        except Exception:
+            pass
+        bg = len(getattr(self, "_background_tasks", None) or {})
+        return [f"{label} {n}" for label, n in (("⚙ PROC", procs), ("◈ AGENTS", agents), ("↻ BG", bg)) if n]
+
+    def _copy_last_available(self) -> bool:
+        """Same predicate ``/copy`` uses to pick the latest response."""
+        from cli import _assistant_copy_text
+        return any(
+            m.get("role") == "assistant" and _assistant_copy_text(m.get("content"))
+            for m in reversed(getattr(self, "conversation_history", None) or []))
+
+    @staticmethod
+    def _quota_style(remaining: Optional[int]) -> str:
+        if remaining is None:
+            return _DIM
+        return _threshold_style(remaining, ((51, "good"), (20, "warn")), "critical")
+
+    def _get_operator_hud_fragments(self, width: Optional[int] = None):
+        """One HUD row: state, running counts, copy control, quota. Segments are in priority order;
+        whatever does not fit the width is dropped, so the state label survives narrow terminals."""
+        if getattr(self, "_model_picker_state", None) or getattr(self, "_command_palette_state", None):
+            return []
+        width = width or self._get_tui_terminal_width()
+        try:
+            segs = [[self._operator_state_fragment()]]
+            segs += [[(_STRONG, label)] for label in self._operator_activity_labels()]
+            if self._copy_last_available():
+                segs.append([(_DIM, "[⧉ Copy last "), (_STRONG, "Alt+C"), (_DIM, "]")])
+            hud = getattr(self, "_quota_hud", None)
+            if hud is not None:
+                from agent.quota_hud import compact_quota
+                for entry in hud.entries():
+                    text, lowest = compact_quota(entry)
+                    segs.append([(self._quota_style(lowest), text)])
+        except Exception:
+            segs = [[self._operator_state_fragment()]]
+        cw, sep = self._status_bar_display_width, " │ "
+        frags, used = [(_SB, " ")], 1
+        for seg in segs:
+            seg_width = sum(cw(text) for _, text in seg) + (cw(sep) if len(frags) > 1 else 0)
+            if used + seg_width > width:
+                continue
+            if len(frags) > 1:
+                frags.append((_DIM, sep))
+            frags.extend(seg)
+            used += seg_width
+        if len(frags) == 1:
+            style, text = segs[0][0]
+            return [(style, self._trim_status_bar_text(text, width))]
+        return frags
 
     # ── prompt stash panel ────────────────────────────────────────────────────
 
