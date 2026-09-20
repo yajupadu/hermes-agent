@@ -223,6 +223,7 @@ def apply_and_attest_child(
         "task_fingerprint": config.fingerprint,
         "subagent_id": subagent_id,
         "session_id": child_session_id,
+        "provider": str(getattr(child, "provider", "") or "") or None,
         "model": actual_model or None,
         "reasoning": config.reasoning,
         "allowed_toolsets": config.allowed_toolsets,
