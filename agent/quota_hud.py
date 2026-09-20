@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -51,15 +52,32 @@ def _window_remaining(snapshot: AccountUsageSnapshot, labels: tuple[str, ...]) -
     return None
 
 
+def _window_reset(snapshot: AccountUsageSnapshot, labels: tuple[str, ...]) -> Optional[str]:
+    for window in snapshot.windows:
+        if window.label in labels and window.reset_at is not None:
+            seconds = max(0, int((window.reset_at - datetime.now(timezone.utc)).total_seconds()))
+            days, remainder = divmod(seconds, 86400)
+            hours, remainder = divmod(remainder, 3600)
+            minutes = remainder // 60
+            if days:
+                return f"{days}d{hours}h"
+            return f"{hours}:{minutes:02d}"
+    return None
+
+
 def compact_quota(entry: QuotaEntry) -> tuple[str, Optional[int]]:
     """(``C1 5h 72% W 61%``, lowest remaining %) — the % is None when unknown or stale."""
     if entry.snapshot is None:
         return f"{entry.label} {'exp' if entry.reason == 'expired' else '?'}", None
     session = _window_remaining(entry.snapshot, _SESSION_LABELS)
     week = _window_remaining(entry.snapshot, _WEEK_LABELS)
+    session_reset = _window_reset(entry.snapshot, _SESSION_LABELS)
+    week_reset = _window_reset(entry.snapshot, _WEEK_LABELS)
     mark = "~" if entry.stale else ""
     text = " ".join(
         f"{name} {mark}{value}%" if value is not None else f"{name} --" for name, value in (("5h", session), ("W", week)))
+    if session_reset or week_reset:
+        text += " " + " ".join(f"↻{value}" for value in (session_reset, week_reset) if value)
     known = [v for v in (session, week) if v is not None]
     return f"{entry.label} {text}", (min(known) if known and not entry.stale else None)
 
@@ -84,8 +102,26 @@ def _fetch_claude(config_dir: Optional[str]) -> AccountUsageSnapshot:
     return fetch_claude_oauth_usage(creds["accessToken"], timeout=8.0)
 
 
-def _fetch_codex() -> AccountUsageSnapshot:
-    snapshot = fetch_account_usage("openai-codex")  # never raises; None on any failure
+def _codex_quota_accounts() -> tuple[tuple[str, str, Optional[str]], ...]:
+    """Build safe CX labels from the installed pool; never expose credential material."""
+    try:
+        from agent.credential_pool import load_pool
+        entries = sorted(load_pool("openai-codex").entries(), key=lambda e: (e.priority, e.id))
+    except Exception:
+        return ()
+    return tuple((f"CX{i}", "openai-codex", entry.id) for i, entry in enumerate(entries, 1))
+
+
+def _fetch_codex(account_id: Optional[str] = None) -> AccountUsageSnapshot:
+    if account_id:
+        from agent.account_usage import _fetch_codex_account_usage
+        from agent.credential_pool import load_pool
+        entry = next((e for e in load_pool("openai-codex").entries() if e.id == account_id), None)
+        if entry is None:
+            raise _QuotaUnavailable("unavailable")
+        snapshot = _fetch_codex_account_usage(entry.runtime_base_url, entry.runtime_api_key)
+    else:
+        snapshot = fetch_account_usage("openai-codex")
     if snapshot is None:
         raise _QuotaUnavailable("unavailable")
     return snapshot
@@ -100,7 +136,7 @@ def account_visible(provider: str, config_dir: Optional[str]) -> bool:
 
 
 def fetch_quota(provider: str, config_dir: Optional[str]) -> AccountUsageSnapshot:
-    snapshot = _fetch_claude(config_dir) if provider == "claude-code" else _fetch_codex()
+    snapshot = _fetch_claude(config_dir) if provider == "claude-code" else _fetch_codex(config_dir)
     if snapshot.unavailable_reason or not snapshot.windows:
         raise _QuotaUnavailable("unavailable")
     return snapshot
@@ -112,6 +148,8 @@ class QuotaHud:
     def __init__(self, accounts=QUOTA_ACCOUNTS, *, ttl: float = TTL_SECONDS,
                  fetch: Callable[[str, Optional[str]], AccountUsageSnapshot] = fetch_quota,
                  on_update: Optional[Callable[[], None]] = None):
+        if accounts == QUOTA_ACCOUNTS:
+            accounts = QUOTA_ACCOUNTS[:2] + _codex_quota_accounts()
         self._accounts = tuple(a for a in accounts if account_visible(a[1], a[2]))
         self._ttl, self._fetch, self._on_update = ttl, fetch, on_update
         self._entries = {label: QuotaEntry(label) for label, _, _ in self._accounts}

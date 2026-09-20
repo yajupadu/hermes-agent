@@ -116,3 +116,27 @@ def test_entries_never_block_on_a_slow_provider_and_cache_within_ttl():
 def test_missing_account_config_dir_is_hidden(tmp_path):
     hud = QuotaHud((("C1", "claude-code", None), ("C2", "claude-code", str(tmp_path / "nope"))), fetch=lambda *a: _snap(0, 0))
     assert [e.label for e in hud._entries.values()] == ["C1"]
+
+
+def test_codex_pool_accounts_refresh_independently(monkeypatch):
+    class Entry:
+        def __init__(self, ident, priority):
+            self.id, self.priority = ident, priority
+            self.runtime_base_url, self.runtime_api_key = "https://example.invalid", f"token-{ident}"
+
+    entries = [Entry("account-one", 0), Entry("account-two", 1)]
+    class Pool:
+        def entries(self):
+            return entries
+
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: Pool())
+    seen = []
+    monkeypatch.setattr("agent.account_usage._fetch_codex_account_usage",
+                        lambda base, token: seen.append(token) or _snap(10 if token.endswith("one") else 20, 30,
+                                                                        "openai-codex", ("Session", "Weekly")))
+    hud = QuotaHud((("CX1", "openai-codex", "account-one"),
+                    ("CX2", "openai-codex", "account-two")), ttl=0)
+    hud.refresh_now()
+    assert seen == ["token-account-one", "token-account-two"]
+    assert compact_quota(hud._entries["CX1"])[0] == "CX1 5h 90% W 70%"
+    assert compact_quota(hud._entries["CX2"])[0] == "CX2 5h 80% W 70%"
