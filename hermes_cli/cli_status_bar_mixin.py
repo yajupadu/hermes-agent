@@ -1222,6 +1222,21 @@ class CLIStatusBarMixin:
             m.get("role") == "assistant" and _assistant_copy_text(m.get("content"))
             for m in reversed(getattr(self, "conversation_history", None) or []))
 
+    def _live_credential_entry_id(self):
+        """Pool entry id this session is actually dispatching on, or None.
+
+        Only a positively exposed identity counts (``_credential_pool_entry_id``, which the pool
+        itself resolves and leaves None when ambiguous). Never inferred from pool order — starring
+        "the first entry" would be a confident lie whenever rotation has moved on."""
+        agent = getattr(self, "agent", None)
+        if (getattr(agent, "provider", "") or "").strip().lower() not in {"openai-codex", "anthropic"}:
+            return None
+        entry_id = getattr(agent, "_credential_pool_entry_id", None)
+        if not isinstance(entry_id, str) or not entry_id:
+            return None
+        provider = (getattr(agent, "provider", "") or "").strip().lower()
+        return provider, entry_id
+
     @staticmethod
     def _quota_style(remaining: Optional[int]) -> str:
         if remaining is None:
@@ -1241,8 +1256,9 @@ class CLIStatusBarMixin:
             hud = getattr(self, "_quota_hud", None)
             if hud is not None:
                 from agent.quota_hud import compact_quota
+                active_id = self._live_credential_entry_id()
                 for entry in hud.entries():
-                    text, lowest = compact_quota(entry)
+                    text, lowest = compact_quota(entry, active_id=active_id)
                     segs.append([(self._quota_style(lowest), text)])
         except Exception:
             segs = [[self._operator_state_fragment()]]

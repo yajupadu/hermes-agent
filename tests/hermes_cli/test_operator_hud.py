@@ -193,6 +193,29 @@ def test_narrow_terminal_keeps_running_and_never_overflows():
     assert "RUNNING" in _text(cli_obj._get_operator_hud_fragments(width=17))
 
 
+def test_active_codex_account_is_starred_only_from_the_live_credential_id():
+    """The star follows the id the session positively exposes; no id (or another provider) => no star."""
+    cli_obj = _make_cli()
+    snap = AccountUsageSnapshot(provider="openai-codex", source="t", fetched_at=datetime.now(timezone.utc),
+                                windows=(AccountUsageWindow("Session", 10), AccountUsageWindow("Weekly", 20)))
+    cli_obj._quota_hud = SimpleNamespace(entries=lambda: [
+        QuotaEntry("CX1", snap, provider="openai-codex", account_id="aa"),
+        QuotaEntry("CX2", snap, provider="openai-codex", account_id="bb")])
+
+    assert "CX1 " in _text(cli_obj._get_operator_hud_fragments(width=200))
+    assert "*" not in _text(cli_obj._get_operator_hud_fragments(width=200))
+
+    cli_obj.agent = SimpleNamespace(provider="openai-codex", _credential_pool_entry_id="bb")
+    starred = _text(cli_obj._get_operator_hud_fragments(width=200))
+    assert "CX2* 5h 90% W 80%" in starred and "CX1 5h 90%" in starred
+
+    # Ambiguous identity (pool could not attribute the key) and non-Codex sessions star nothing.
+    cli_obj.agent = SimpleNamespace(provider="openai-codex", _credential_pool_entry_id=None)
+    assert "*" not in _text(cli_obj._get_operator_hud_fragments(width=200))
+    cli_obj.agent = SimpleNamespace(provider="anthropic", _credential_pool_entry_id="bb")
+    assert "*" not in _text(cli_obj._get_operator_hud_fragments(width=200))
+
+
 def test_quota_style_thresholds():
     style = HermesCLI._quota_style
     assert style(51) == "class:status-bar-good"

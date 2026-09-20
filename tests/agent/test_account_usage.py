@@ -37,6 +37,31 @@ class _FakeClient:
         return _FakeResponse(self.payload)
 
 
+class _SequenceClient:
+    def __init__(self, calls, responses):
+        self.calls = calls
+        self.responses = iter(responses)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, headers):
+        self.calls.append({"url": url, "headers": headers})
+        response = next(self.responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def _http_status_error(status_code):
+    request = httpx.Request("GET", "https://chatgpt.com/backend-api/wham/usage")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError("request failed", request=request, response=response)
+
+
 @pytest.fixture
 def codex_usage_payload():
     return {
@@ -118,6 +143,63 @@ def test_codex_usage_falls_back_to_native_credential_pool(monkeypatch, codex_usa
     assert snapshot.windows[1].label == "Weekly"
     assert calls[0]["url"] == "https://chatgpt.com/backend-api/wham/usage"
     assert calls[0]["headers"]["Authorization"] == "Bearer pooled-token"
+
+
+@pytest.mark.parametrize("credential_id", ["cx1", "cx2"])
+def test_codex_usage_read_only_401_does_not_refresh_or_cross_accounts(
+    monkeypatch, codex_usage_payload, credential_id,
+):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _SequenceClient(calls, [_http_status_error(401)]),
+    )
+    refresh_calls = []
+    pool = SimpleNamespace(
+        try_refresh_matching=lambda **kwargs: refresh_calls.append(kwargs),
+        select=lambda: (_ for _ in ()).throw(AssertionError("select must not run")),
+        mark_exhausted=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not exhaust")),
+        quarantine=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not quarantine")),
+    )
+    import agent.credential_pool as credential_pool
+    monkeypatch.setattr(credential_pool, "load_pool", lambda provider: pool)
+
+    assert account_usage._fetch_codex_account_usage(
+        "https://chatgpt.com/backend-api/codex", f"{credential_id}-token", refresh_on_401=False,
+    ) is None
+    assert calls[0]["headers"]["Authorization"] == f"Bearer {credential_id}-token"
+    assert refresh_calls == []
+
+
+def test_codex_usage_normal_401_preserves_refresh_retry(monkeypatch, codex_usage_payload):
+    calls = []
+    responses = iter([_http_status_error(401), _FakeResponse(codex_usage_payload)])
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _SequenceClient(calls, responses),
+    )
+    refreshed = SimpleNamespace(
+        runtime_api_key="cx1-refreshed",
+        runtime_base_url="https://chatgpt.com/backend-api/codex",
+    )
+    refresh_calls = []
+    pool = SimpleNamespace(
+        try_refresh_matching=lambda **kwargs: refresh_calls.append(kwargs) or refreshed,
+    )
+    import agent.credential_pool as credential_pool
+    monkeypatch.setattr(credential_pool, "load_pool", lambda provider: pool)
+    monkeypatch.setattr(account_usage, "_read_codex_tokens", lambda: {"tokens": {}})
+
+    snapshot = account_usage._fetch_codex_account_usage(
+        "https://chatgpt.com/backend-api/codex", "cx1-token",
+    )
+    assert snapshot is not None
+    assert refresh_calls == [{"api_key_hint": "cx1-token"}]
+    assert [call["headers"]["Authorization"] for call in calls] == [
+        "Bearer cx1-token", "Bearer cx1-refreshed",
+    ]
     # Pool creds have no account_id concept — the ChatGPT-Account-ID header must
     # be omitted rather than sent stale/wrong.
     assert "ChatGPT-Account-ID" not in calls[0]["headers"]
@@ -176,6 +258,31 @@ def test_codex_snapshot_exposes_exact_raw_payload_with_one_get(monkeypatch, code
 def test_codex_invalid_payload_fails_closed(monkeypatch):
     snapshot, _ = _explicit_creds_snapshot(monkeypatch, ["not", "a", "dict"])
     assert snapshot is None
+
+
+def test_anthropic_explicit_api_key_is_authoritative(monkeypatch):
+    calls = []
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, headers):
+            calls.append(headers)
+            return _FakeResponse({
+                "five_hour": {"utilization": 0.10, "resets_at": "2030-01-01T00:00:00Z"},
+                "seven_day": {"utilization": 0.20, "resets_at": "2030-01-02T00:00:00Z"},
+            })
+
+    monkeypatch.setattr(account_usage.httpx, "Client", lambda timeout: Client())
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: "token-A")
+
+    account_usage._fetch_anthropic_account_usage(api_key="sk-ant-oat-token-B")
+
+    assert calls[0]["Authorization"] == "Bearer sk-ant-oat-token-B"
 
 
 def test_codex_usage_account_id_read_failure_keeps_singleton_token(monkeypatch, codex_usage_payload):

@@ -432,7 +432,7 @@ def _plural(count: int) -> str:
 
 
 def _fetch_codex_account_usage(
-    base_url: Optional[str] = None, api_key: Optional[str] = None,
+    base_url: Optional[str] = None, api_key: Optional[str] = None, *, refresh_on_401: bool = True,
 ) -> Optional[AccountUsageSnapshot]:
     token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
     try:
@@ -442,6 +442,8 @@ def _fetch_codex_account_usage(
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code != 401:
             raise
+        if not refresh_on_401:
+            return None
         token, resolved_base_url, account_id = _resolve_codex_usage_credentials(
             base_url, api_key, force_refresh=True,
         )
@@ -591,7 +593,9 @@ def redeem_codex_reset_credit(
 def _fetch_anthropic_account_usage(
     base_url: Optional[str] = None, api_key: Optional[str] = None
 ) -> Optional[AccountUsageSnapshot]:
-    token = (resolve_anthropic_token() or "").strip()
+    # An explicit pool credential is authoritative.  Resolving the ambient token here would
+    # make per-account HUD requests silently query whichever Anthropic login happens to be first.
+    token = (api_key if api_key is not None else resolve_anthropic_token() or "").strip()
     if not token:
         return None
     if not _is_oauth_token(token):

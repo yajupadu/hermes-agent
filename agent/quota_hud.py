@@ -13,22 +13,45 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Callable, Optional
 
-from agent.account_usage import AccountUsageSnapshot, fetch_account_usage, fetch_claude_oauth_usage, remaining_percent
+from agent.account_usage import AccountUsageSnapshot, remaining_percent
+from agent.operator_quota import (
+    OperatorQuotaUnavailable as _QuotaUnavailable,
+    fetch_quota as _fetch_exact_quota,
+    quota_accounts,
+    set_pool_reader,
+)
 
 logger = logging.getLogger(__name__)
 
-# (label, provider, Claude config dir). C1 is Claude Code's default login (no CLAUDE_CONFIG_DIR, ~/.claude);
-# C2 is the isolated CLAUDE_CONFIG_DIR login. An account whose config dir does not exist is not shown.
-# ponytail: fixed account list, move to display config when someone needs a different layout.
-QUOTA_ACCOUNTS: tuple[tuple[str, str, Optional[str]], ...] = (
-    ("C1", "claude-code", None),
-    ("C2", "claude-code", "~/.claude-account2"),
-    ("CX", "openai-codex", None),
-)
-TTL_SECONDS = 300.0
+# Compatibility patch point for older integrations.  The service remains the owner of
+# discovery; this is only a replaceable read function, never a mutable pool object.
+# It is intentionally None by default so HUD does not import or read the auth store.
+read_credential_pool = None
+
+
+def fetch_quota(provider: str, account_id: str):
+    """Fetch one exact persisted account; provider-wide resolution is forbidden here."""
+    if not isinstance(account_id, str) or not account_id.strip():
+        raise _QuotaUnavailable("unavailable")
+    return _fetch_exact_quota(provider, account_id)
+
+
+def _codex_quota_accounts():
+    set_pool_reader(read_credential_pool)
+    return tuple(account for account in quota_accounts() if account[1] == "openai-codex")
+
+
+def account_visible(provider: str, config_dir: Optional[str]) -> bool:
+    from pathlib import Path
+    return provider != "claude-code" or config_dir is None or Path(config_dir).expanduser().is_dir()
+
+# Kept as a compatibility sentinel for callers that used the old default.  Actual accounts are
+# built from the Hermes-owned credential pools below; Claude Code keychain/config state is never
+# an account source for this HUD.
+QUOTA_ACCOUNTS: tuple[tuple[str, str, Optional[str]], ...] = ()
+TTL_SECONDS = 60.0
 _SESSION_LABELS = ("Current session", "Session")
 _WEEK_LABELS = ("Current week", "Weekly")
 
@@ -39,6 +62,9 @@ class QuotaEntry:
     snapshot: Optional[AccountUsageSnapshot] = None  # last GOOD snapshot
     reason: str = ""  # set when the latest check failed
     checked_at: float = 0.0
+    provider: Optional[str] = None
+    # Identity of the account this row fetches: the persisted credential id.
+    account_id: Optional[str] = None
 
     @property
     def stale(self) -> bool:
@@ -65,99 +91,55 @@ def _window_reset(snapshot: AccountUsageSnapshot, labels: tuple[str, ...]) -> Op
     return None
 
 
-def compact_quota(entry: QuotaEntry) -> tuple[str, Optional[int]]:
-    """(``C1 5h 72% W 61%``, lowest remaining %) — the % is None when unknown or stale."""
+def compact_quota(entry: QuotaEntry, *, active_id: Optional[tuple[str, str]] = None) -> tuple[str, Optional[int]]:
+    """(``C1 5h 72% ↻2:10 W 61%``, lowest remaining %) — the % is None when unknown or stale.
+
+    Only the windows the provider actually supplied are rendered, each carrying its own reset
+    countdown, so a Codex account that reports one window does not print a phantom second one.
+    ``active_id`` is always the provider-qualified identity exposed by the live session."""
+    active = (isinstance(active_id, tuple) and len(active_id) == 2 and
+              isinstance(entry.provider, str) and bool(entry.provider) and
+              isinstance(entry.account_id, str) and bool(entry.account_id) and
+              active_id == (entry.provider, entry.account_id))
+    label = entry.label + ("*" if active else "")
+    if entry.reason == "expired":
+        return f"{label} exp", None
     if entry.snapshot is None:
-        return f"{entry.label} {'exp' if entry.reason == 'expired' else '?'}", None
-    session = _window_remaining(entry.snapshot, _SESSION_LABELS)
-    week = _window_remaining(entry.snapshot, _WEEK_LABELS)
-    session_reset = _window_reset(entry.snapshot, _SESSION_LABELS)
-    week_reset = _window_reset(entry.snapshot, _WEEK_LABELS)
+        return f"{label} ?", None
     mark = "~" if entry.stale else ""
-    text = " ".join(
-        f"{name} {mark}{value}%" if value is not None else f"{name} --" for name, value in (("5h", session), ("W", week)))
-    if session_reset or week_reset:
-        text += " " + " ".join(f"↻{value}" for value in (session_reset, week_reset) if value)
-    known = [v for v in (session, week) if v is not None]
-    return f"{entry.label} {text}", (min(known) if known and not entry.stale else None)
-
-
-def _fetch_claude(config_dir: Optional[str]) -> AccountUsageSnapshot:
-    from agent.anthropic_credentials import (
-        _read_claude_code_credentials_from_keychain, is_claude_code_token_valid,
-        read_claude_code_credentials_for_config_dir)
-    if config_dir is None:
-        # Default login only (keychain entry without suffix). Deliberately not resolve_anthropic_token(): that
-        # prefers env/Hermes-pool credentials, which would mix the accounts.
-        creds = _read_claude_code_credentials_from_keychain()
-        if creds is None:
-            from agent.anthropic_credentials import _read_claude_code_credentials_from_file
-            creds = _read_claude_code_credentials_from_file()
-    else:
-        creds = read_claude_code_credentials_for_config_dir(Path(config_dir).expanduser())
-    if not creds:
-        raise _QuotaUnavailable("not logged in")
-    if not is_claude_code_token_valid(creds):
-        raise _QuotaUnavailable("expired")
-    return fetch_claude_oauth_usage(creds["accessToken"], timeout=8.0)
-
-
-def _codex_quota_accounts() -> tuple[tuple[str, str, Optional[str]], ...]:
-    """Build safe CX labels from the installed pool; never expose credential material."""
-    try:
-        from agent.credential_pool import load_pool
-        entries = sorted(load_pool("openai-codex").entries(), key=lambda e: (e.priority, e.id))
-    except Exception:
-        return ()
-    return tuple((f"CX{i}", "openai-codex", entry.id) for i, entry in enumerate(entries, 1))
-
-
-def _fetch_codex(account_id: Optional[str] = None) -> AccountUsageSnapshot:
-    if account_id:
-        from agent.account_usage import _fetch_codex_account_usage
-        from agent.credential_pool import load_pool
-        entry = next((e for e in load_pool("openai-codex").entries() if e.id == account_id), None)
-        if entry is None:
-            raise _QuotaUnavailable("unavailable")
-        snapshot = _fetch_codex_account_usage(entry.runtime_base_url, entry.runtime_api_key)
-    else:
-        snapshot = fetch_account_usage("openai-codex")
-    if snapshot is None:
-        raise _QuotaUnavailable("unavailable")
-    return snapshot
-
-
-class _QuotaUnavailable(Exception):
-    pass
-
-
-def account_visible(provider: str, config_dir: Optional[str]) -> bool:
-    return provider != "claude-code" or config_dir is None or Path(config_dir).expanduser().is_dir()
-
-
-def fetch_quota(provider: str, config_dir: Optional[str]) -> AccountUsageSnapshot:
-    snapshot = _fetch_claude(config_dir) if provider == "claude-code" else _fetch_codex(config_dir)
-    if snapshot.unavailable_reason or not snapshot.windows:
-        raise _QuotaUnavailable("unavailable")
-    return snapshot
+    parts, known = [], []
+    for name, labels in (("5h", _SESSION_LABELS), ("W", _WEEK_LABELS)):
+        value = _window_remaining(entry.snapshot, labels)
+        if value is None:
+            continue
+        known.append(value)
+        reset = _window_reset(entry.snapshot, labels)
+        parts.append(f"{name} {mark}{value}%" + (f" ↻{reset}" if reset else ""))
+    if not parts:
+        return f"{label} ?", None
+    return f"{label} {' '.join(parts)}", (min(known) if not entry.stale else None)
 
 
 class QuotaHud:
     """Per-account cache; ``entries()`` is render-safe and kicks a background refresh when due."""
 
-    def __init__(self, accounts=QUOTA_ACCOUNTS, *, ttl: float = TTL_SECONDS,
-                 fetch: Callable[[str, Optional[str]], AccountUsageSnapshot] = fetch_quota,
+    def __init__(self, accounts=None, *, ttl: float = TTL_SECONDS,
+                 fetch: Callable[[str, str], AccountUsageSnapshot] = fetch_quota,
                  on_update: Optional[Callable[[], None]] = None):
-        if accounts == QUOTA_ACCOUNTS:
-            accounts = QUOTA_ACCOUNTS[:2] + _codex_quota_accounts()
-        self._accounts = tuple(a for a in accounts if account_visible(a[1], a[2]))
+        dynamic_accounts = accounts is None or accounts == QUOTA_ACCOUNTS
+        if dynamic_accounts:
+            set_pool_reader(read_credential_pool)
+            accounts = quota_accounts()
+        self._accounts = tuple(a for a in accounts if (not dynamic_accounts or a[1] != "claude-code")
+                               and account_visible(a[1], a[2]))
         self._ttl, self._fetch, self._on_update = ttl, fetch, on_update
-        self._entries = {label: QuotaEntry(label) for label, _, _ in self._accounts}
+        self._entries = {(provider, account_id): QuotaEntry(label, provider=provider, account_id=account_id)
+                         for label, provider, account_id in self._accounts}
         self._thread: Optional[threading.Thread] = None
 
     def entries(self) -> list[QuotaEntry]:
         self.refresh_if_due()
-        return [self._entries[label] for label, _, _ in self._accounts]
+        return [self._entries[(provider, account_id)] for label, provider, account_id in self._accounts]
 
     def refresh_if_due(self) -> None:
         now = time.time()
@@ -170,18 +152,19 @@ class QuotaHud:
 
     def refresh_now(self) -> None:
         for label, provider, config_dir in self._accounts:
-            old = self._entries[label]
+            identity = (provider, config_dir)
+            old = self._entries[identity]
             if time.time() - old.checked_at < self._ttl:
                 continue
             try:
-                new = QuotaEntry(label, self._fetch(provider, config_dir), "", time.time())
+                new = QuotaEntry(label, self._fetch(provider, config_dir), "", time.time(), provider, old.account_id)
             except _QuotaUnavailable as exc:
-                new = QuotaEntry(label, old.snapshot, str(exc), time.time())
+                new = QuotaEntry(label, old.snapshot, str(exc), time.time(), provider, old.account_id)
             except Exception as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 logger.debug("quota hud ▸ %s fetch failed (%s)", label, type(exc).__name__)
-                new = QuotaEntry(label, old.snapshot, f"HTTP {status}" if status else "error", time.time())
-            self._entries[label] = new
+                new = QuotaEntry(label, old.snapshot, f"HTTP {status}" if status else "error", time.time(), provider, old.account_id)
+            self._entries[identity] = new
         if self._on_update is not None:
             try:
                 self._on_update()
@@ -192,11 +175,16 @@ class QuotaHud:
         """Expanded view for ``/usage``: per-account windows with reset times (cached, no network)."""
         from agent.account_usage import render_account_usage_lines
         lines: list[str] = []
-        for entry in (self._entries[label] for label, _, _ in self._accounts):
-            if entry.snapshot is not None:
+        for entry in (self._entries[(provider, account_id)] for label, provider, account_id in self._accounts):
+            if entry.reason == "expired":
+                lines.append(f"📈 {entry.label} limits")
+                lines.append(f"Unknown: {entry.reason}")
+            elif entry.snapshot is not None:
                 lines.extend(render_account_usage_lines(dataclasses.replace(entry.snapshot, title=f"{entry.label} limits")))
+                if entry.reason:
+                    lines.append(f"Stale: {entry.reason}")
             else:
                 lines.append(f"📈 {entry.label} limits")
-            if entry.reason:
-                lines.append(f"{'Stale' if entry.snapshot else 'Unknown'}: {entry.reason}")
+                if entry.reason:
+                    lines.append(f"Unknown: {entry.reason}")
         return lines
