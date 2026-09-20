@@ -49,6 +49,9 @@ from tools.delegate_tool_registry import (  # noqa: F401
 from tools.delegate_tool_tasks import (  # noqa: F401
     _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
 )
+from tools.delegate_tool_contract import (
+    DelegationDispatchConfig, apply_and_attest_child, build_dispatch_configs,
+)
 from tools.delegate_tool_toolsets import (  # noqa: F401
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
 )
@@ -58,8 +61,8 @@ from tools.delegate_tool_results import (  # noqa: F401
 
 _ROLES = frozenset({"leaf", "orchestrator"})
 
-# Nested delegation is granted by depth/role in _build_child_agent, never by the
-# model naming toolsets (there is no model-facing toolsets argument).
+# Nested delegation remains depth-derived. ``allowed_toolsets`` is a narrowing
+# ceiling and cannot grant delegation or any capability absent from the parent.
 def _normalize_role(r: Optional[str]) -> str:
     """'leaf' | 'orchestrator'; None/empty/unknown -> 'leaf' (unknown warns)."""
     r_norm = str(r).strip().lower() if r else "leaf"
@@ -176,6 +179,7 @@ def _build_child_agent(
     # callers such as /review pass auxiliary.review here so fallback policy is
     # not accidentally read from the general delegation block.
     routing_cfg: Optional[Dict[str, Any]] = None,
+    dispatch_config: Optional[DelegationDispatchConfig] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
 ):
@@ -222,6 +226,7 @@ def _build_child_agent(
         override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
+        reasoning=(dispatch_config.reasoning if dispatch_config is not None else None),
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -263,6 +268,13 @@ def _build_child_agent(
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    if dispatch_config is not None:
+        try:
+            apply_and_attest_child(child, parent_agent, dispatch_config, effective_model=model)
+        except ValueError:
+            with _quiet("Failed to close unattested delegated child", exc_info=True):
+                child.close()
+            raise
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
@@ -360,7 +372,8 @@ def _run_single_child(
 
 
 def _build_children(
-    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
+    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any],
+    dispatch_configs: List[DelegationDispatchConfig], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
@@ -378,6 +391,7 @@ def _build_children(
     }
     children = []
     for i, t in enumerate(task_list):
+        dispatch_config = dispatch_configs[i]
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
@@ -385,11 +399,17 @@ def _build_children(
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
-                toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
+                toolsets=(list(dispatch_config.allowed_toolsets) if dispatch_config.allowed_toolsets is not None else None),
+                model=dispatch_config.model or creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                dispatch_config=dispatch_config,
             )
         except ValueError as exc:
+            from tools.delegate_tool_child_run import _detach_child
+            for _, _, built_child in children:
+                _detach_child(parent_agent, built_child)
+                with _quiet("Failed to close child after delegation preflight failure", exc_info=True):
+                    built_child.close()
             return [], str(exc)
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
@@ -440,6 +460,8 @@ def delegate_task(
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None, reasoning: Optional[str] = None,
+    allowed_toolsets: Optional[List[str]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -495,11 +517,19 @@ def delegate_task(
         # spawn loudly (#80450).
         return tool_error(str(exc))
     max_children = _get_max_concurrent_children()
-    task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
+    task_list, err = _normalize_task_list(
+        goal, context, tasks, output_schema, top_role, max_children,
+        model=model, reasoning=reasoning, allowed_toolsets=allowed_toolsets,
+    )
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if not err:
         task_images, err = _coerce_task_images(task_list, images)
+    if not err:
+        try:
+            dispatch_configs = build_dispatch_configs(task_list, parent_agent, creds)
+        except ValueError as exc:
+            err = str(exc)
     if err:
         return tool_error(err)
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
@@ -517,7 +547,8 @@ def delegate_task(
     origin = _capture_origin()
 
     children, err = _build_children(
-        task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
+        task_list, task_schemas, creds, dispatch_configs, top_role=top_role,
+        max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
     )
     if err:
@@ -526,6 +557,7 @@ def delegate_task(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
     )
+    batch.dispatch_configs = dispatch_configs
     return _run_batch(batch, background)
 
 
@@ -642,7 +674,7 @@ DELEGATE_TASK_SCHEMA = {
         "properties": {
             # The handler also accepts the legacy single-goal shape (top-level `goal`/`context`/`output_schema`),
             # wrapped into a one-entry batch at dispatch, and a per-task `role` (legacy, ignored: capability is
-            # depth-derived). Both unadvertised on purpose (old transcripts only); do not re-add. No maxItems — the
+            # depth-derived). Those legacy fields stay unadvertised. No maxItems — the
             # runtime limit (delegation.max_concurrent_children) is enforced with a clear error in delegate_task().
             "tasks": {
                 "type": "array",
@@ -682,6 +714,22 @@ DELEGATE_TASK_SCHEMA = {
                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
                             "order execution; if B needs A's output, dispatch B after A returns.",
                         ),
+                        "model": _p(
+                            "string",
+                            "Optional exact model id for this child. Unsupported or auto-corrected ids are rejected.",
+                        ),
+                        "reasoning": _p(
+                            "string",
+                            "Optional reasoning policy for this child.",
+                            enum=["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+                        ),
+                        "allowed_toolsets": _p(
+                            "array",
+                            "Optional restrictive child capability ceiling. It can only narrow the parent; "
+                            "'file' is inspection-only (read/search), and omitted preserves inheritance.",
+                            minItems=1,
+                            items={"type": "string"},
+                        ),
                     },
                     "required": ["goal"],
                 },
@@ -704,6 +752,22 @@ DELEGATE_TASK_SCHEMA = {
                 "string",
                 "For action='steer': the course correction, appended to "
                 "the child's next tool result mid-run. Be directive and specific.",
+            ),
+            "model": _p(
+                "string",
+                "Optional exact model id applied to tasks that do not set their own model. Unsupported ids fail closed.",
+            ),
+            "reasoning": _p(
+                "string",
+                "Optional reasoning policy applied to tasks that do not set their own reasoning value.",
+                enum=["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+            ),
+            "allowed_toolsets": _p(
+                "array",
+                "Optional restrictive capability ceiling applied to tasks that do not set their own list. "
+                "It can only narrow the parent; 'file' is inspection-only (read/search).",
+                minItems=1,
+                items={"type": "string"},
             ),
         },
         "required": [],
@@ -740,6 +804,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        model=args.get("model"), reasoning=args.get("reasoning"), allowed_toolsets=args.get("allowed_toolsets"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

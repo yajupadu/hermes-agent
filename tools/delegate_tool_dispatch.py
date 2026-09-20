@@ -45,6 +45,7 @@ class _Batch:
     origin_owner_session_record: Any
     origin_session_history_delivery: bool
     overall_start: float
+    dispatch_configs: Optional[List[Any]] = None
     # Set on per-group units carved out by ``_dispatch_background``; None for the whole batch / ungrouped units.
     group: Optional[str] = None
     unit_id: Optional[str] = None  # the async registry id this unit runs under (``<call_id>-k`` for split calls)
@@ -380,11 +381,14 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         for c in child_agents:
             _signal_child_stop(c, "Async delegation cancelled")
 
+    unit_configs = [unit.dispatch_configs[i] for i, _, _ in unit.children] if unit.dispatch_configs else []
+    toolset_values = {cfg.allowed_toolsets for cfg in unit_configs}
+    model_values = {cfg.model or unit.creds["model"] for cfg in unit_configs}
     return dispatch_async_delegation_batch(
         # Call-wide goals: completion formatting indexes them by task_index.
         goals=[t["goal"] for t in unit.task_list], context=unit.context,
-        toolsets=None,  # metadata for the completion block only; subagents inherit the parent's toolsets
-        role=unit.top_role, model=unit.creds["model"],
+        toolsets=(list(next(iter(toolset_values))) if len(toolset_values) == 1 and next(iter(toolset_values)) is not None else None),
+        role=unit.top_role, model=(next(iter(model_values)) if len(model_values) == 1 else None),
         runner=lambda: _execute_and_aggregate(unit, honor_parent_interrupt=False),
         interrupt_fn=_interrupt, delegation_id=unit_id, slot_key=slot_key,
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,

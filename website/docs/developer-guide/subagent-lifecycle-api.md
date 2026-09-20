@@ -21,6 +21,8 @@ def launch_review(ctx):
         goal="Review this change for regressions.",
         context="Only inspect the supplied repository.",
         role="leaf",
+        model="openai/gpt-5",
+        reasoning="high",
         correlation_id="review-42",
         allowed_toolsets=("file",),
     ))
@@ -55,7 +57,11 @@ starts a replacement child. Running Python threads also cannot survive process
 exit; callers must treat those handles as interrupted by process exit.
 
 Requests are fail-closed: goal/context/metadata sizes are capped, unknown or
-parent-broadening toolsets are rejected, and per-tool blocks, working-directory
-overrides, and per-launch timeouts are explicitly rejected until Hermes can
-support them without weakening isolation. Use `allowed_toolsets` to narrow a
-child; Hermes's existing unsafe-tool block remains enforced.
+parent-broadening toolsets, unsupported models, invalid reasoning policies, and
+child identity or runtime mismatches are rejected. Per-tool blocks,
+working-directory overrides, and per-launch timeouts remain explicitly rejected
+until Hermes can support them without weakening isolation. Use
+`allowed_toolsets` to narrow a child. An explicit `("file",)` scope is
+inspection-only (`read_file` and `search_files`); it does not grant file writes,
+terminal access, or web access. Omitting all three dispatch overrides preserves
+the inherited child configuration.

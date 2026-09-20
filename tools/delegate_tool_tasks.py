@@ -65,7 +65,8 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 def _normalize_task_list(
-    goal, context, tasks, output_schema, top_role: str, max_children: int
+    goal, context, tasks, output_schema, top_role: str, max_children: int,
+    model=None, reasoning=None, allowed_toolsets=None,
 ) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
     """``(task_list, None)`` from ``tasks=[...]`` or the legacy single ``goal``, else ``(None, error)``."""
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -89,6 +90,12 @@ def _normalize_task_list(
         task_list = [{"goal": goal, "context": context, "role": top_role}]
         if output_schema is not None:
             task_list[0]["output_schema"] = output_schema
+        if model is not None:
+            task_list[0]["model"] = model
+        if reasoning is not None:
+            task_list[0]["reasoning"] = reasoning
+        if allowed_toolsets is not None:
+            task_list[0]["allowed_toolsets"] = allowed_toolsets
     else:
         return None, (
             "No tasks provided. Pass tasks=[{goal: '...', context: '...'}, "
@@ -100,6 +107,12 @@ def _normalize_task_list(
             return None, f"Task {i} must be an object, got {type(task).__name__}."
         if not task.get("goal", "").strip():
             return None, f"Task {i} is missing a 'goal'."
+        if model is not None and "model" not in task:
+            task["model"] = model
+        if reasoning is not None and "reasoning" not in task:
+            task["reasoning"] = reasoning
+        if allowed_toolsets is not None and "allowed_toolsets" not in task:
+            task["allowed_toolsets"] = allowed_toolsets
     # The single-goal form is exempt from the batch gate (short goals are valid there).
     batch_error = _validate_batch_tasks(task_list) if isinstance(tasks, list) else None
     return (None, batch_error) if batch_error else (task_list, None)

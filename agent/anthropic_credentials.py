@@ -302,9 +302,44 @@ def _keychain_mirror_command(account: str, payload: Dict[str, Any]) -> tuple[lis
     return ["security", "-i"], line
 
 
-def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
-    """Read the "Claude Code-credentials" macOS Keychain entry (Claude Code >=2.1.114)."""
-    payload = _read_claude_code_keychain_payload()
+def _read_claude_code_credentials_from_keychain(
+    service: str = _CLAUDE_CODE_KEYCHAIN_SERVICE,
+) -> Optional[Dict[str, Any]]:
+    """Read a Claude Code OAuth credential from macOS Keychain.
+
+    The default service keeps upstream's account-aware Claude Code reader.
+    A suffixed service is used read-only for isolated CLAUDE_CONFIG_DIR
+    accounts shown by the operator quota HUD.
+    """
+    if service == _CLAUDE_CODE_KEYCHAIN_SERVICE:
+        payload = _read_claude_code_keychain_payload()
+    else:
+        if platform.system() != "Darwin":
+            return None
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-s", service, "-w"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        raw = result.stdout.strip()
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+
     return _claude_oauth_record(payload, "macos_keychain") if payload else None
 
 
@@ -320,6 +355,28 @@ def claude_code_credentials_path() -> Path:
 def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
     data = _load_json_if_exists(claude_code_credentials_path(), "~/.claude/.credentials.json")
     return _claude_oauth_record(data, "claude_code_credentials_file") if data is not None else None
+
+
+def read_claude_code_credentials_for_config_dir(
+    config_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    """Read credentials for an isolated CLAUDE_CONFIG_DIR without refreshing them."""
+    suffix = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+    creds = _read_claude_code_credentials_from_keychain(
+        f"Claude Code-credentials-{suffix}"
+    )
+    if creds:
+        return creds
+
+    data = _load_json_if_exists(
+        config_dir / ".credentials.json",
+        ".credentials.json",
+    )
+    return (
+        _claude_oauth_record(data, "claude_code_credentials_file")
+        if isinstance(data, dict)
+        else None
+    )
 
 
 def read_claude_code_credentials() -> Optional[Dict[str, Any]]:

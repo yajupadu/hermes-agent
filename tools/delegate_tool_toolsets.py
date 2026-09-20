@@ -8,7 +8,7 @@ from typing import List, Optional
 from toolsets import TOOLSETS, resolve_toolset
 from tools.delegate_tool_config import _get_inherit_mcp_toolsets
 
-logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
+logger = logging.getLogger("tools.delegate_tool")
 
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset(
@@ -22,8 +22,9 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 )
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
+
 def _is_mcp_toolset_name(name: str) -> bool:
-    """Return True for canonical MCP toolsets and their registered aliases."""
+    """Return True for canonical MCP toolsets and registered aliases."""
     if not name:
         return False
     if str(name).startswith("mcp-"):
@@ -99,9 +100,9 @@ def _resolve_child_toolsets(
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
         if _get_inherit_mcp_toolsets():
-            # Append any parent MCP toolsets missing from the narrowed child.
             child_toolsets += [
-                name for name in sorted(parent_toolsets) if _is_mcp_toolset_name(name) and name not in child_toolsets
+                name for name in sorted(parent_toolsets)
+                if _is_mcp_toolset_name(name) and name not in child_toolsets
             ]
     elif parent_agent and parent_enabled is not None:
         child_toolsets = parent_enabled

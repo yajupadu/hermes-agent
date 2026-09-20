@@ -58,6 +58,7 @@ class SubagentLaunchRequest:
     correlation_id: Optional[str] = None
     metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     timeout_seconds: Optional[float] = None
+    reasoning: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,6 +73,9 @@ class SubagentHandle:
     role: str
     depth: int
     capability: str
+    reasoning: Optional[str] = None
+    allowed_toolsets: Optional[tuple[str, ...]] = None
+    task_fingerprint: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -79,7 +83,10 @@ class SubagentHandle:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "SubagentHandle":
         try:
-            return cls(**dict(value))
+            fields = dict(value)
+            if isinstance(fields.get("allowed_toolsets"), list):
+                fields["allowed_toolsets"] = tuple(fields["allowed_toolsets"])
+            return cls(**fields)
         except (TypeError, ValueError) as exc:
             raise SubagentLifecycleError("Malformed subagent handle.") from exc
 
@@ -212,6 +219,9 @@ _HANDLE_FIELD_CHECKS: tuple[tuple[str, Callable[[Any], bool]], ...] = (
     ("role", lambda v: isinstance(v, str)),
     ("depth", lambda v: type(v) is int),
     ("capability", lambda v: isinstance(v, str)),
+    ("reasoning", _opt_str),
+    ("allowed_toolsets", lambda v: v is None or isinstance(v, tuple) and all(isinstance(x, str) for x in v)),
+    ("task_fingerprint", _opt_str),
 )
 
 # Launch-request rejections in check order: (predicate, error). The type check leads so later predicates may
@@ -257,11 +267,31 @@ class SubagentLifecycleService:
                 raise SubagentLifecycleError("Duplicate correlation_id for this parent session.")
         # Lazy: delegate construction stays internal, plugins never import private delegation helpers.
         from tools.delegate_tool import _build_child_preserving_parent_tools, DEFAULT_MAX_ITERATIONS
-        child = _build_child_preserving_parent_tools(
-            task_index=0, goal=request.goal, context=request.context,
-            toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
-            model=request.model, max_iterations=DEFAULT_MAX_ITERATIONS, task_count=1, parent_agent=parent, role=request.role,
-        )
+        from tools.delegate_tool_contract import apply_and_attest_child, build_dispatch_configs
+        credentials = {
+            key: getattr(parent, key, None)
+            for key in ("model", "provider", "base_url", "api_key", "api_mode")
+        }
+        task = {
+            "goal": request.goal,
+            "context": request.context,
+            "model": request.model,
+            "reasoning": request.reasoning,
+            "allowed_toolsets": request.allowed_toolsets,
+        }
+        try:
+            dispatch = build_dispatch_configs([task], parent, credentials)[0]
+            child = _build_child_preserving_parent_tools(
+                task_index=0, goal=request.goal, context=request.context,
+                toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
+                model=request.model, max_iterations=DEFAULT_MAX_ITERATIONS, task_count=1, parent_agent=parent,
+                role=request.role, dispatch_config=dispatch,
+            )
+            attestation = apply_and_attest_child(
+                child, parent, dispatch, effective_model=request.model or getattr(parent, "model", None)
+            )
+        except ValueError as exc:
+            raise SubagentLifecycleError(str(exc)) from exc
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:
             raise SubagentLifecycleError("Hermes failed to assign a child identity.")
@@ -270,6 +300,7 @@ class SubagentLifecycleService:
             PUBLIC_CONTRACT_VERSION, subagent_id, parent_session_id, request.correlation_id, created,
             getattr(child, "provider", None), getattr(child, "model", None), getattr(child, "_delegate_role", request.role),
             int(getattr(child, "_delegate_depth", 1) or 1), self._capability(subagent_id, parent_session_id, created),
+            attestation.get("reasoning"), attestation.get("allowed_toolsets"), dispatch.fingerprint,
         )
         record = _Record(handle, SubagentState.PENDING, created, agent=child)
         with _REGISTRY.lock:
@@ -342,7 +373,8 @@ class SubagentLifecycleService:
         if _session_id_of(self._parent_agent_resolver()) != handle.parent_session_id:
             return None
         with _REGISTRY.lock:
-            return _REGISTRY.records.get(handle.subagent_id)
+            record = _REGISTRY.records.get(handle.subagent_id)
+            return record if record is not None and record.handle == handle else None
 
     @staticmethod
     def _cleanup_locked() -> None:
@@ -405,12 +437,11 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError("metadata must be JSON-serializable.") from exc
         if metadata_bytes > _MAX_METADATA_BYTES:
             raise SubagentLifecycleError("metadata exceeds 8192 bytes.")
-        if not request.allowed_toolsets:
+        from tools.delegate_tool_contract import normalize_allowed_toolsets, normalize_reasoning
+        try:
+            normalize_reasoning(request.reasoning)
+            normalized_toolsets = normalize_allowed_toolsets(request.allowed_toolsets)
+        except ValueError as exc:
+            raise SubagentLifecycleError(str(exc)) from exc
+        if normalized_toolsets is None:
             return
-        from toolsets import TOOLSETS
-        unknown = set(request.allowed_toolsets) - set(TOOLSETS)
-        if unknown:
-            raise SubagentLifecycleError(f"Unknown toolsets: {', '.join(sorted(unknown))}.")
-        enabled = getattr(parent, "enabled_toolsets", None)
-        if enabled is not None and not set(request.allowed_toolsets).issubset(set(enabled)):
-            raise SubagentLifecycleError("Requested toolsets would broaden parent permissions.")

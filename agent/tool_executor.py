@@ -447,6 +447,9 @@ def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _Parse
     scope_block = None
     if parse_error is None:
         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
+        allowed = getattr(agent, "_delegate_allowed_tools", None)
+        if allowed is not None and name not in allowed:
+            scope_block = f"'{name}' is outside this delegated child's allowed_toolsets contract."
     return _ParsedCall(tool_call, name, args, [], parse_error, scope_block)
 
 
