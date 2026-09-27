@@ -7,7 +7,7 @@ Shell launcher:
   ROOT before integration: /Users/yajupadu/.hermes/worktrees/hermes-agent-operator-hud
   ROOT after integration: /Users/yajupadu/.hermes/worktrees/hermes-active-runtime-authority
   PYTHON: /Users/yajupadu/.hermes/hermes-agent/venv/bin/python
-  exec: "$PYTHON" "$ROOT/hermes" -p trader "$@"
+  exec: "$PYTHON" "$ROOT/hermes" -p trader --in "$ROOT" --no-restore-cwd "$@"
 
 Pre-fix proof:
   The launcher changed directory to operator-hud before executing Hermes.
