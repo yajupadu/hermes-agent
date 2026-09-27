@@ -39,6 +39,8 @@ def controller_attestation() -> dict[str, Any]:
 
 def require_repository_authority() -> dict[str, Any]:
     """Fail closed unless all repository-control modules come from one source root."""
+    if REPOSITORY_AUTHORITY_VERSION != 1:
+        raise RepositoryAuthorityError("REPOSITORY_AUTHORITY_UNAVAILABLE")
     expected = str(Path(__file__).resolve().parents[1])
     module_names = (
         "tools.repository_authority", "tools.delegate_tool", "tools.subagent_worktree",

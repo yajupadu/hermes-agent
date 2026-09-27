@@ -77,6 +77,14 @@ def test_mixed_control_plane_sources_fail_closed(monkeypatch):
         require_repository_authority()
 
 
+def test_missing_authority_version_fails_closed(monkeypatch):
+    import tools.repository_authority as authority
+
+    monkeypatch.setattr(authority, "REPOSITORY_AUTHORITY_VERSION", 0)
+    with pytest.raises(RepositoryAuthorityError, match="REPOSITORY_AUTHORITY_UNAVAILABLE"):
+        authority.require_repository_authority()
+
+
 def test_controller_cwd_cannot_replace_target(tmp_path):
     controller = tmp_path / "controller"
     target = tmp_path / "target"
