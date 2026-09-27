@@ -333,7 +333,8 @@ def _run_single_child(
         child, parent_agent, goal, owner_session_id=owner_session_id, owner_transport=owner_transport,
         owner_session_record=owner_session_record,
     )
-    run = _ChildRun(child, parent_agent, task_index, goal, _subagent_id, child_progress_cb, heartbeat=heartbeat)
+    run = _ChildRun(child, parent_agent, task_index, goal, _subagent_id, child_progress_cb,
+                    heartbeat=heartbeat, repository_authority=getattr(child, "repository_authority", None))
     # Set when a timed-out Future still owns the child: closing it from this
     # thread before the worker settles races the conversation's finally path.
     _child_close_deferred = False
@@ -419,6 +420,8 @@ def _build_children(
         if _t_images:
             with _quiet("Could not attach images to child %d", i):
                 child._delegate_images = _t_images
+        if t.get("repository_authority"):
+            setattr(child, "repository_authority", t["repository_authority"])
         # Tee progress events into the live transcript (wrapper keeps the
         # _flush contract and swallows writer failures).
         _writer = live_writers[i] if i < len(live_writers) else None
@@ -521,6 +524,15 @@ def delegate_task(
         goal, context, tasks, output_schema, top_role, max_children,
         model=model, reasoning=reasoning, allowed_toolsets=allowed_toolsets,
     )
+    if not err:
+        from tools.repository_authority import RepositoryAuthorityError, resolve_repository_authority
+        try:
+            for task in task_list:
+                authority = resolve_repository_authority(task)
+                if authority:
+                    task["repository_authority"] = authority
+        except RepositoryAuthorityError as exc:
+            err = str(exc)
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if not err:

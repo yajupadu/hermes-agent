@@ -9,6 +9,7 @@ import json
 import os
 import threading
 import time
+from contextlib import nullcontext
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional
 from agent.interrupt_compat import request_hard_interrupt
@@ -338,14 +339,17 @@ def _register_child(
     })
     return _subagent_id
 
-def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_id: Optional[str]):
+def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_id: Optional[str],
+                              authority: Optional[Dict[str, Any]] = None):
     """Opt-in worktree isolation: own git worktree off the parent's HEAD (the
-    child's terminal starts there). Git-only, local-backend-only; failures
-    degrade silently to the shared workspace. Returns the worktree info or None."""
+    child's terminal starts there). Explicit authority never degrades to a
+    shared workspace. Returns the worktree info or None for legacy tasks."""
     from tools.delegate_tool import _get_worktree_isolation, _resolve_workspace_hint
+    if authority and not _get_worktree_isolation():
+        raise RuntimeError("WORKSPACE_BOOTSTRAP_FAILED")
     if not _get_worktree_isolation():
         return None
-    with _quiet("worktree isolation setup failed: %s"):
+    with _quiet("worktree isolation setup failed: %s") if not authority else nullcontext():
         from tools import subagent_worktree
         if not subagent_worktree.local_backend_active():
             logger.debug("worktree isolation skipped: non-local terminal backend")
@@ -354,9 +358,13 @@ def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_i
         with _quiet(None):
             from tools.terminal_tool import get_session_cwd as _gsc
             _parent_cwd = _gsc(parent_task_id)
-        return subagent_worktree.create_subagent_worktree(
+        info = subagent_worktree.create_subagent_worktree(
             _parent_cwd or _resolve_workspace_hint(parent_agent), subagent_id=subagent_id,
+            authority=authority,
         )
+        if authority and info is None:
+            raise RuntimeError("WORKSPACE_BOOTSTRAP_FAILED")
+        return info
     return None
 
 def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
@@ -676,6 +684,7 @@ class _ChildRun:
     parent_task_id: Optional[str] = None
     wall_start: float = 0.0
     parent_reads_snapshot: list = field(default_factory=list)
+    repository_authority: Optional[Dict[str, Any]] = None
 
     def elapsed(self) -> float:
         return round(time.monotonic() - self.child_start, 2)
@@ -715,7 +724,8 @@ class _ChildRun:
             record_session_cwd(self.child_task_id, get_session_cwd(self.parent_task_id))
             register_container_alias(self.child_task_id, self.parent_task_id)
 
-        self.worktree_info = _create_isolated_worktree(self.parent_agent, self.parent_task_id, self.subagent_id)
+        self.worktree_info = _create_isolated_worktree(
+            self.parent_agent, self.parent_task_id, self.subagent_id, self.repository_authority)
         if self.worktree_info is not None:
             with _quiet("worktree cwd seed failed: %s"):
                 from tools.terminal_tool import record_session_cwd as _rsc
