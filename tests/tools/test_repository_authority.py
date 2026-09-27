@@ -4,7 +4,12 @@ import subprocess
 
 import pytest
 
-from tools.repository_authority import RepositoryAuthorityError, resolve_repository_authority
+from tools.repository_authority import (
+    REPOSITORY_AUTHORITY_VERSION,
+    RepositoryAuthorityError,
+    require_repository_authority,
+    resolve_repository_authority,
+)
 from tools.subagent_worktree import create_subagent_worktree
 
 
@@ -55,6 +60,21 @@ def test_worktree_comes_from_target_and_exact_head(tmp_path):
     head = subprocess.check_output(["git", "-C", info["path"], "rev-parse", "HEAD"], text=True).strip()
     assert root == str(target.resolve()) + "/.worktrees/authority-test"
     assert head == target_sha
+
+
+def test_authority_attests_controller_source_and_version():
+    attestation = require_repository_authority()
+    assert attestation["controller_source_root"].endswith("hermes-active-runtime-authority")
+    assert attestation["controller_head"]
+    assert attestation["repository_authority_version"] == REPOSITORY_AUTHORITY_VERSION == 1
+
+
+def test_mixed_control_plane_sources_fail_closed(monkeypatch):
+    import tools.subagent_worktree as subagent_worktree
+
+    monkeypatch.setattr(subagent_worktree, "__file__", "/tmp/operator-hud/tools/subagent_worktree.py")
+    with pytest.raises(RepositoryAuthorityError, match="CONTROL_PLANE_SOURCE_MISMATCH"):
+        require_repository_authority()
 
 
 def test_controller_cwd_cannot_replace_target(tmp_path):

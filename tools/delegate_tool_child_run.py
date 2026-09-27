@@ -555,6 +555,7 @@ def _build_result_entry(
     # Result entry contract: see the _run_single_child docstring.
     entry: Dict[str, Any] = {
         "task_index": task_index,
+        "repository_authority": getattr(child, "repository_authority", None),
         "status": status,
         "summary": summary,
         "api_calls": result.get("api_calls", 0),
