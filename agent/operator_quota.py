@@ -8,13 +8,17 @@ persist credentials.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from agent import account_usage
+from agent import anthropic_credentials
 from agent.account_usage import AccountUsageSnapshot
 from hermes_cli.auth import read_credential_pool
 
 _pool_reader = read_credential_pool
+_CLAUDE_DEFAULT_ID = "claude-default"
+_CLAUDE_ACCOUNT2_ID = "claude-account2"
 
 
 def set_pool_reader(reader) -> None:
@@ -79,7 +83,12 @@ def _canonical_status(row: object) -> Optional[str]:
 
 
 def discover_accounts(provider: str) -> tuple[OperatorQuotaAccount, ...]:
-    """Discover only persisted Hermes-owned rows, without invoking pool mutation."""
+    """Discover read-only quota identities without invoking pool mutation."""
+    if provider == "claude-code":
+        accounts = [OperatorQuotaAccount(provider, _CLAUDE_DEFAULT_ID, "C1", 0)]
+        if (Path.home() / ".claude-account2").is_dir():
+            accounts.append(OperatorQuotaAccount(provider, _CLAUDE_ACCOUNT2_ID, "C2", 1))
+        return tuple(accounts)
     prefix = "C" if provider == "anthropic" else "CX" if provider == "openai-codex" else None
     if prefix is None:
         return ()
@@ -117,8 +126,28 @@ def _exact_row(account: OperatorQuotaAccount) -> object:
     raise OperatorQuotaUnavailable("unavailable")
 
 
+def _claude_credentials(account: OperatorQuotaAccount) -> dict:
+    if account.credential_id == _CLAUDE_DEFAULT_ID:
+        credentials = anthropic_credentials.read_claude_code_credentials()
+    elif account.credential_id == _CLAUDE_ACCOUNT2_ID:
+        credentials = anthropic_credentials.read_claude_code_credentials_for_config_dir(
+            Path.home() / ".claude-account2"
+        )
+    else:
+        credentials = None
+    if not credentials or not anthropic_credentials.is_claude_code_token_valid(credentials):
+        raise OperatorQuotaUnavailable("expired" if credentials else "unavailable")
+    return credentials
+
+
 def fetch_exact(account: OperatorQuotaAccount) -> AccountUsageSnapshot:
     """Fetch exactly this persisted account; no ambient resolver or refresh path."""
+    if account.provider == "claude-code":
+        credentials = _claude_credentials(account)
+        result = account_usage._fetch_anthropic_account_usage(None, credentials["accessToken"])
+        if result is None or result.unavailable_reason or not result.windows:
+            raise OperatorQuotaUnavailable("unavailable")
+        return result
     row = _exact_row(account)
     token = getattr(row, "runtime_api_key", "") or ""
     if _canonical_status(row) == "exp":
@@ -147,13 +176,12 @@ def fetch_quota(provider: str, credential_id: str) -> AccountUsageSnapshot:
 
 
 def account_visible(provider: str, config_dir: Optional[str]) -> bool:
-    # External Claude Code/keychain accounts are intentionally not a source for this service.
-    return provider in {"anthropic", "openai-codex"}
+    return provider in {"claude-code", "anthropic", "openai-codex"}
 
 
 def quota_accounts() -> tuple[tuple[str, str, str], ...]:
     return tuple((a.slot_name, a.provider, a.credential_id)
-                 for provider in ("anthropic", "openai-codex")
+                 for provider in ("claude-code", "anthropic", "openai-codex")
                  for a in discover_accounts(provider))
 
 

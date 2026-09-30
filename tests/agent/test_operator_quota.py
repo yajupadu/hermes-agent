@@ -85,3 +85,44 @@ def test_fetch_exact_fails_closed_when_row_disappears(monkeypatch):
     monkeypatch.setattr(operator_quota, "_pool_reader", lambda provider: [])
     with pytest.raises(operator_quota.OperatorQuotaUnavailable):
         operator_quota.fetch_exact(account)
+
+
+def test_claude_code_accounts_are_independent_and_read_only(monkeypatch, tmp_path):
+    account2 = tmp_path / ".claude-account2"
+    account2.mkdir()
+    monkeypatch.setattr(operator_quota.Path, "home", lambda: tmp_path)
+    credentials = {
+        operator_quota._CLAUDE_DEFAULT_ID: {"accessToken": "c1", "expiresAt": 0},
+        operator_quota._CLAUDE_ACCOUNT2_ID: {"accessToken": "c2", "expiresAt": 0},
+    }
+    monkeypatch.setattr(
+        operator_quota.anthropic_credentials,
+        "read_claude_code_credentials",
+        lambda: credentials[operator_quota._CLAUDE_DEFAULT_ID],
+    )
+    monkeypatch.setattr(
+        operator_quota.anthropic_credentials,
+        "read_claude_code_credentials_for_config_dir",
+        lambda path: credentials[operator_quota._CLAUDE_ACCOUNT2_ID],
+    )
+    monkeypatch.setattr(
+        operator_quota.anthropic_credentials,
+        "is_claude_code_token_valid",
+        lambda value: True,
+    )
+    calls = []
+    result = SimpleNamespace(windows=[object()], unavailable_reason=None)
+    monkeypatch.setattr(
+        operator_quota.account_usage,
+        "_fetch_anthropic_account_usage",
+        lambda base_url, token: calls.append(token) or result,
+    )
+
+    accounts = operator_quota.discover_accounts("claude-code")
+    assert [(a.slot_name, a.credential_id) for a in accounts] == [
+        ("C1", operator_quota._CLAUDE_DEFAULT_ID),
+        ("C2", operator_quota._CLAUDE_ACCOUNT2_ID),
+    ]
+    assert operator_quota.fetch_exact(accounts[0]) is result
+    assert operator_quota.fetch_exact(accounts[1]) is result
+    assert calls == ["c1", "c2"]

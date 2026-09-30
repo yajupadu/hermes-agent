@@ -130,8 +130,7 @@ class QuotaHud:
         if dynamic_accounts:
             set_pool_reader(read_credential_pool)
             accounts = quota_accounts()
-        self._accounts = tuple(a for a in accounts if (not dynamic_accounts or a[1] != "claude-code")
-                               and account_visible(a[1], a[2]))
+        self._accounts = tuple(a for a in accounts if account_visible(a[1], a[2]))
         self._ttl, self._fetch, self._on_update = ttl, fetch, on_update
         self._entries = {(provider, account_id): QuotaEntry(label, provider=provider, account_id=account_id)
                          for label, provider, account_id in self._accounts}
