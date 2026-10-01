@@ -43,13 +43,18 @@ def _codex_quota_accounts():
     return tuple(account for account in quota_accounts() if account[1] == "openai-codex")
 
 
-def account_visible(provider: str, config_dir: Optional[str]) -> bool:
+def account_visible(provider: str, account_id: Optional[str]) -> bool:
+    if provider != "claude-code" or account_id is None:
+        return True
     from pathlib import Path
-    return provider != "claude-code" or config_dir is None or Path(config_dir).expanduser().is_dir()
+    config_dirs = {"claude-default": ".claude", "claude-account2": ".claude-account2"}
+    dirname = config_dirs.get(account_id)
+    if dirname is not None:
+        return (Path.home() / dirname).is_dir()
+    return Path(account_id).expanduser().is_dir()
 
-# Kept as a compatibility sentinel for callers that used the old default.  Actual accounts are
-# built from the Hermes-owned credential pools below; Claude Code keychain/config state is never
-# an account source for this HUD.
+# Kept as a compatibility sentinel for callers that used the old default.  Actual accounts come
+# from agent.operator_quota.quota_accounts(): Claude1/Claude2 (Claude Code logins) and CX1..n.
 QUOTA_ACCOUNTS: tuple[tuple[str, str, Optional[str]], ...] = ()
 TTL_SECONDS = 60.0
 _SESSION_LABELS = ("Current session", "Session")
@@ -92,7 +97,7 @@ def _window_reset(snapshot: AccountUsageSnapshot, labels: tuple[str, ...]) -> Op
 
 
 def compact_quota(entry: QuotaEntry, *, active_id: Optional[tuple[str, str]] = None) -> tuple[str, Optional[int]]:
-    """(``C1 5h 72% ↻2:10 W 61%``, lowest remaining %) — the % is None when unknown or stale.
+    """(``Claude1 5h 72% ↻2:10 W 61%``, lowest remaining %) — the % is None when unknown or stale.
 
     Only the windows the provider actually supplied are rendered, each carrying its own reset
     countdown, so a Codex account that reports one window does not print a phantom second one.
@@ -126,12 +131,12 @@ class QuotaHud:
     def __init__(self, accounts=None, *, ttl: float = TTL_SECONDS,
                  fetch: Callable[[str, str], AccountUsageSnapshot] = fetch_quota,
                  on_update: Optional[Callable[[], None]] = None):
-        dynamic_accounts = accounts is None or accounts == QUOTA_ACCOUNTS
-        if dynamic_accounts:
+        if accounts is None or accounts == QUOTA_ACCOUNTS:
             set_pool_reader(read_credential_pool)
-            accounts = quota_accounts()
-        self._accounts = tuple(a for a in accounts if (not dynamic_accounts or a[1] != "claude-code")
-                               and account_visible(a[1], a[2]))
+            accounts = quota_accounts()  # discovery already omits missing Claude config dirs
+        else:
+            accounts = tuple(a for a in accounts if account_visible(a[1], a[2]))
+        self._accounts = tuple(accounts)
         self._ttl, self._fetch, self._on_update = ttl, fetch, on_update
         self._entries = {(provider, account_id): QuotaEntry(label, provider=provider, account_id=account_id)
                          for label, provider, account_id in self._accounts}

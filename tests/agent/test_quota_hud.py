@@ -2,10 +2,12 @@
 
 import dataclasses
 import hashlib
+import json
 import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 import pytest
@@ -16,6 +18,21 @@ from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow, remain
 from agent.quota_hud import QuotaEntry, QuotaHud, compact_quota, fetch_quota
 
 _FAR_FUTURE_MS = int((time.time() + 3600) * 1000)
+
+
+@pytest.fixture(autouse=True)
+def _home(tmp_path, monkeypatch):
+    """Claude Code logins are discovered under $HOME; no test may reach the real ones."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    return home
+
+
+def _claude_login(home, dirname, token, expires_ms=_FAR_FUTURE_MS):
+    (home / dirname).mkdir()
+    (home / dirname / ".credentials.json").write_text(json.dumps(
+        {"claudeAiOauth": {"accessToken": token, "refreshToken": f"refresh-{token}", "expiresAt": expires_ms}}))
 
 
 def _pool_row(ident, priority=0, label="safe-label", token="fake-token", *, status=None):
@@ -36,7 +53,8 @@ def test_hud_discovery_never_invokes_mutating_load_pool(monkeypatch):
                         lambda *a, **k: _snap(3, 4, "openai-codex", ("Session", "Weekly")))
     hud = QuotaHud(ttl=0)
     hud.refresh_now()
-    assert [entry.account_id for entry in hud.entries()] == ["a1", "x1"]
+    # The anthropic pool mirrors the Claude Code logins, which are the Claude slots; never both.
+    assert [entry.account_id for entry in hud.entries()] == ["x1"]
 
 
 def test_codex_hud_uses_each_pool_entry_without_refresh_or_cross_account_fallthrough(monkeypatch):
@@ -116,43 +134,18 @@ def test_compact_quota_separates_percentage_from_reset_arrow():
     assert "%↻" not in text
 
 
-def test_anthropic_hud_enumerates_pool_and_binds_each_token(monkeypatch):
-    entries = [_pool_row("c2-id", 1, "John Smith <john@example.com>", "fake-anthropic-B"),
-               _pool_row("c1-id", 0, "John Smith <john@example.com>", "fake-anthropic-A")]
-    monkeypatch.setattr(hud_mod, "read_credential_pool", lambda provider: entries if provider == "anthropic" else [])
-    used = []
-    def fake_usage(base_url, api_key):
-        used.append(api_key)
-        return _snap(10, 20)
-    monkeypatch.setattr(account_usage, "_fetch_anthropic_account_usage", fake_usage)
-
-    def fetch(provider, account_id):
-        if provider != "anthropic":
-            raise AssertionError("codex is outside this test")
-        entry = next(e for e in entries if e["id"] == account_id)
-        return account_usage._fetch_anthropic_account_usage(None, entry["access_token"])
-    hud = QuotaHud(ttl=999, fetch=fetch)
-    hud.refresh_now()
-    assert [(e.label, e.account_id) for e in hud.entries()] == [("C1", "c1-id"), ("C2", "c2-id")]
-    assert used == ["fake-anthropic-A", "fake-anthropic-B"]
-    rendered = "\n".join(compact_quota(entry)[0] for entry in hud.entries())
-    assert "John Smith" not in rendered and "john@example.com" not in rendered
+def _forbid_credential_mutation(monkeypatch):
+    def forbidden(name):
+        return lambda *a, **k: (_ for _ in ()).throw(AssertionError(name))
+    monkeypatch.setattr("agent.credential_pool.load_pool", forbidden("load_pool"))
+    monkeypatch.setattr(creds_mod, "_refresh_oauth_token", forbidden("refresh"))
+    monkeypatch.setattr(creds_mod, "_post_oauth_token", forbidden("refresh"))
+    monkeypatch.setattr(creds_mod, "_write_claude_code_credentials", forbidden("write"))
+    # The Keychain is host state; these tests use the per-login credential files.
+    monkeypatch.setattr(creds_mod, "_read_claude_code_credentials_from_keychain", lambda *a, **k: None)
 
 
-def test_anthropic_persisted_pool_flows_through_service_into_hud(monkeypatch):
-    row = _pool_row("anthropic-one", 0, token="sk-ant-oat01-exact-anthropic-token")
-    monkeypatch.setattr(hud_mod, "read_credential_pool",
-                        lambda provider: [row] if provider == "anthropic" else [])
-    calls = []
-
-    class Response:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"five_hour": {"utilization": 12, "resets_at": "2030-01-01T00:00:00Z"},
-                    "seven_day": {"utilization": 34, "resets_at": "2030-01-02T00:00:00Z"}}
-
+def _oauth_usage_client(monkeypatch, calls, status=lambda token: 200):
     class Client:
         def __enter__(self):
             return self
@@ -162,18 +155,57 @@ def test_anthropic_persisted_pool_flows_through_service_into_hud(monkeypatch):
 
         def get(self, url, headers):
             calls.append((url, headers["Authorization"]))
-            return Response()
+            request = httpx.Request("GET", url)
+            return httpx.Response(status(headers["Authorization"]), request=request, json={
+                "five_hour": {"utilization": 12, "resets_at": "2030-01-01T00:00:00Z"},
+                "seven_day": {"utilization": 34, "resets_at": "2030-01-02T00:00:00Z"}})
 
     monkeypatch.setattr(account_usage.httpx, "Client", lambda timeout: Client())
+
+
+def test_claude_code_logins_flow_through_service_into_hud_each_with_its_own_token(_home, monkeypatch):
+    """Integration: real discovery + credential files + usage parsing; only HTTP is faked."""
+    _claude_login(_home, ".claude", "sk-ant-oat01-default-token")
+    _claude_login(_home, ".claude-account2", "sk-ant-oat01-account2-token")
+    # CLAUDE_CONFIG_DIR may point at the other login; Claude1 must still be the default login.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(_home / ".claude-account2"))
+    monkeypatch.setattr(hud_mod, "read_credential_pool", lambda provider: [
+        _pool_row("pool-anthropic", token="sk-ant-oat01-pool-token")] if provider == "anthropic" else [])
+    _forbid_credential_mutation(monkeypatch)
+    calls = []
+    _oauth_usage_client(monkeypatch, calls)
     hud = QuotaHud(ttl=0)
     hud.refresh_now()
-    assert calls == [("https://api.anthropic.com/api/oauth/usage", "Bearer sk-ant-oat01-exact-anthropic-token")]
-    assert compact_quota(hud.entries()[0])[0].startswith("C1 5h 88%")
+    url = "https://api.anthropic.com/api/oauth/usage"
+    assert calls == [(url, "Bearer sk-ant-oat01-default-token"), (url, "Bearer sk-ant-oat01-account2-token")]
+    assert [(e.label, e.provider, e.account_id) for e in hud.entries()] == [
+        ("Claude1", "claude-code", "claude-default"), ("Claude2", "claude-code", "claude-account2")]
+    assert [compact_quota(e)[0].split(" ↻")[0] for e in hud.entries()] == ["Claude1 5h 88%", "Claude2 5h 88%"]
 
 
-def test_external_claude_credentials_are_not_hud_accounts(monkeypatch):
-    hud = QuotaHud(accounts=None)
-    assert all(provider != "claude-code" for _, provider, _ in hud._accounts)
+def test_claude_code_login_failures_stay_on_their_own_slot(_home, monkeypatch, caplog):
+    """Expired → exp with no request and no refresh; a 401 is a sanitized reason, never the other login."""
+    _claude_login(_home, ".claude", "sk-ant-oat01-default-token")
+    _claude_login(_home, ".claude-account2", "sk-ant-oat01-account2-token", expires_ms=1)
+    monkeypatch.setattr(hud_mod, "read_credential_pool", lambda provider: [])
+    _forbid_credential_mutation(monkeypatch)
+    calls = []
+    _oauth_usage_client(monkeypatch, calls, status=lambda token: 401)
+    hud = QuotaHud(ttl=0)
+    with caplog.at_level(logging.DEBUG):
+        hud.refresh_now()
+    assert [token for _, token in calls] == ["Bearer sk-ant-oat01-default-token"]
+    assert [compact_quota(e)[0] for e in hud.entries()] == ["Claude1 ?", "Claude2 exp"]
+    shown = "\n".join([*hud.usage_lines(), caplog.text])
+    assert "Unknown: HTTP 401" in shown and "Unknown: expired" in shown
+    assert "sk-ant-" not in shown and "refresh-" not in shown
+
+
+def test_missing_claude_login_dirs_are_omitted_and_labels_stay_stable(_home, monkeypatch):
+    monkeypatch.setattr(hud_mod, "read_credential_pool", lambda provider: [])
+    assert QuotaHud()._accounts == ()
+    (_home / ".claude-account2").mkdir()
+    assert QuotaHud()._accounts == (("Claude2", "claude-code", "claude-account2"),)
 
 
 def test_missing_exact_account_id_fails_closed_without_ambient_usage(monkeypatch):
