@@ -85,3 +85,16 @@ def test_fetch_exact_fails_closed_when_row_disappears(monkeypatch):
     monkeypatch.setattr(operator_quota, "_pool_reader", lambda provider: [])
     with pytest.raises(operator_quota.OperatorQuotaUnavailable):
         operator_quota.fetch_exact(account)
+
+
+@pytest.mark.parametrize(
+    ("refresh_token", "expected"),
+    (("rotated-refresh-token", "refresh"), ("", "expired")),
+)
+def test_claude_code_expiry_distinguishes_refreshable_from_terminal(monkeypatch, refresh_token, expected):
+    account2 = {"accessToken": "access-2", "refreshToken": refresh_token, "expiresAt": 0}
+    monkeypatch.setattr(operator_quota, "_CLAUDE_CODE_DIRS", {"claude-account2": ".claude-account2"})
+    monkeypatch.setattr(operator_quota.anthropic_credentials, "read_claude_code_credentials_for_config_dir", lambda _: account2)
+    monkeypatch.setattr(operator_quota.anthropic_credentials, "is_claude_code_token_valid", lambda _: False)
+    with pytest.raises(operator_quota.OperatorQuotaUnavailable, match=expected or "expired"):
+        operator_quota._claude_code_token("claude-account2")

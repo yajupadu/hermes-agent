@@ -146,6 +146,13 @@ def _claude_code_token(credential_id: str) -> str:
     if not creds:
         raise OperatorQuotaUnavailable("unavailable")
     if not anthropic_credentials.is_claude_code_token_valid(creds):
+        # The HUD is deliberately read-only.  Claude Code owns OAuth refresh and
+        # its rotation/persistence lock; an expired access token plus a refresh
+        # token is therefore recoverable, not proof that the account is dead.
+        # Never invoke the refresh endpoint here: doing so could consume a
+        # single-use rotation without committing it to this exact account store.
+        if creds.get("refreshToken"):
+            raise OperatorQuotaUnavailable("refresh")
         raise OperatorQuotaUnavailable("expired")
     return creds["accessToken"]
 

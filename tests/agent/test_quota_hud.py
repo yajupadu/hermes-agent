@@ -184,7 +184,7 @@ def test_claude_code_logins_flow_through_service_into_hud_each_with_its_own_toke
 
 
 def test_claude_code_login_failures_stay_on_their_own_slot(_home, monkeypatch, caplog):
-    """Expired → exp with no request and no refresh; a 401 is a sanitized reason, never the other login."""
+    """Expired access with a refresh token is refreshable, never terminal exp."""
     _claude_login(_home, ".claude", "sk-ant-oat01-default-token")
     _claude_login(_home, ".claude-account2", "sk-ant-oat01-account2-token", expires_ms=1)
     monkeypatch.setattr(hud_mod, "read_credential_pool", lambda provider: [])
@@ -195,9 +195,9 @@ def test_claude_code_login_failures_stay_on_their_own_slot(_home, monkeypatch, c
     with caplog.at_level(logging.DEBUG):
         hud.refresh_now()
     assert [token for _, token in calls] == ["Bearer sk-ant-oat01-default-token"]
-    assert [compact_quota(e)[0] for e in hud.entries()] == ["Claude1 ?", "Claude2 exp"]
+    assert [compact_quota(e)[0] for e in hud.entries()] == ["Claude1 ?", "Claude2 refresh"]
     shown = "\n".join([*hud.usage_lines(), caplog.text])
-    assert "Unknown: HTTP 401" in shown and "Unknown: expired" in shown
+    assert "Unknown: HTTP 401" in shown and "Unknown: refresh" in shown
     assert "sk-ant-" not in shown and "refresh-" not in shown
 
 
@@ -354,6 +354,11 @@ def test_active_identity_requires_provider_and_rejects_mismatch_or_providerless(
     assert not compact_quota(entry, active_id=("openai-codex", "bb"))[0].startswith("C1*")
     providerless = dataclasses.replace(entry, provider=None)
     assert not compact_quota(providerless, active_id=("anthropic", "bb"))[0].startswith("C1*")
+
+
+def test_refreshable_state_is_not_terminal_and_does_not_show_cached_quota():
+    entry = QuotaEntry("C2", _snap(10, 20), "refresh", provider="anthropic", account_id="c2")
+    assert compact_quota(entry) == ("C2 refresh", None)
 
 
 def test_expired_state_wins_over_cached_snapshot():

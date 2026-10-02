@@ -109,6 +109,8 @@ def compact_quota(entry: QuotaEntry, *, active_id: Optional[tuple[str, str]] = N
     label = entry.label + ("*" if active else "")
     if entry.reason == "expired":
         return f"{label} exp", None
+    if entry.reason == "refresh":
+        return f"{label} refresh", None
     if entry.snapshot is None:
         return f"{label} ?", None
     mark = "~" if entry.stale else ""
