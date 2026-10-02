@@ -110,8 +110,11 @@ from hermes_cli.update_cmd_maint import (  # noqa: F401
     _sweep_bytecode_after_update,
     _update_complete_message, _verify_and_restore_one_state_db,
     _verify_and_restore_state_dbs_post_update)
+from hermes_cli.update_active_runtime import (  # noqa: F401
+    ActiveRuntimeState, collect_worktree_state, list_active_runtime_worktrees,
+    install_update_launcher, preflight_active_runtimes, reconcile_active_runtime,
+    reconcile_all_active_runtimes)
 logger = logging.getLogger(__name__)
-
 
 def _m():
     """Lazy ``hermes_cli.main`` handle: keeps main-side test patches effective, import one-way."""
@@ -124,6 +127,24 @@ def _updates_config() -> dict:
     from hermes_cli.config import load_config
     section = (load_config() or {}).get("updates", {})
     return section if isinstance(section, dict) else {}
+
+
+def _active_runtime_authority() -> tuple[str | None, list[str] | None]:
+    """Return the durable active-runtime anchor and optional configured paths.
+
+    Promotion updates this config record; it must never require editing updater
+    source.  Missing authority is deliberately represented as ``None`` so the
+    normal preflight fails closed.
+    """
+    cfg = _updates_config()
+    authority = cfg.get("active_runtime_authority", {})
+    if not isinstance(authority, dict):
+        authority = {}
+    sha = authority.get("sha") or cfg.get("preservation_anchor_sha")
+    paths = authority.get("paths") or cfg.get("active_runtime_paths")
+    if paths is not None and not isinstance(paths, list):
+        paths = None
+    return (sha if isinstance(sha, str) and sha else None), paths
 
 
 def _no_prompt_git_kwargs() -> dict:
@@ -1542,6 +1563,30 @@ def _cmd_update_impl(args, gateway_mode: bool):
     opts = _resolve_update_options(args, gateway_mode)
     gw_input_fn, assume_yes = opts.gw_input_fn, opts.assume_yes
 
+    # This must precede all normal update preparation: an active runtime is the
+    # launch authority and may not be observed only after canonical mutation.
+    _ar_states = []
+    _ar_anchor_sha: str | None = None
+    _ar_paths: list[str] | None = None
+    if not getattr(args, "post_swap", None):
+        _ar_anchor_sha, _ar_paths = _active_runtime_authority()
+        _ar_candidate_paths = list_active_runtime_worktrees(
+            _m().PROJECT_ROOT, _ar_paths)
+        if not _ar_candidate_paths:
+            _ar_states = []
+        elif _ar_anchor_sha is None:
+            print("✗ Active-runtime authority is missing; refusing update.")
+            sys.exit(1)
+        else:
+            _ar_ok, _ar_states, _ar_errors = preflight_active_runtimes(
+                _m().PROJECT_ROOT, _ar_anchor_sha, _ar_candidate_paths)
+            if not _ar_ok:
+                print("✗ Active-runtime worktree preflight failed:")
+                for err in _ar_errors:
+                    print(f"  • {err}")
+                print()
+                sys.exit(1)
+
     # A child spawned off hermes.exe already outwaited its parent in ``cmd_update`` (before the
     # update lock, so the lock it now holds is its own — the parent's marker left with it).
     from hermes_cli.update_handoff import adopt_handed_off_gateway_resume
@@ -1660,11 +1705,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Shallow, exact count unrecoverable — but the tips differ, so there IS an update.
             print("→ Updates available (commit count unknown on this shallow checkout)")
 
+
         print("→ Pulling updates...")
         pre_pull_sha = _pull_updates(
             git_cmd, branch, _plan.auto_stash_ref, prompt_for_restore=_plan.prompt_for_restore,
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
             keep_stash=opts.keep_stash)
+
+        # Reconcile active-runtime worktrees: merge upstream into their history
+        # so the anchor ancestry is preserved (never replace with canonical HEAD).
+        if _ar_states:
+            assert _ar_anchor_sha is not None
+            _rec_ok, _rec_msgs = reconcile_all_active_runtimes(
+                _m().PROJECT_ROOT, f"origin/{branch}", _ar_anchor_sha, _ar_paths)
+            if not _rec_ok:
+                print("⚠ Active-runtime reconciliation failed:")
+                for msg in _rec_msgs:
+                    print(f"  • {msg}")
+                _finalize_receipt(
+                    "failed", "Update receipt finalize after active-runtime reconciliation failure failed: %s"
+                )
+                sys.exit(1)
+
         _apply_pulled_update(
             git_cmd, branch, pre_pull_sha, _plan, opts, gateway_mode=gateway_mode,
             is_fork=is_fork, desktop_dir=desktop_dir,
