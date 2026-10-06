@@ -51,6 +51,16 @@ class TestOfficialHostAuthority:
         result = _validate("gpt-5.6-terra", "https://us.api.openai.com/v1", live=["gpt-5.6-terra"])
         assert result["accepted"] is True
 
+    def test_empty_curated_intersection_is_marked_as_fallback(self):
+        curated = models_mod._PROVIDER_MODELS["openai-api"]
+        with mock_patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), mock_patch.object(
+            models_mod, "fetch_api_models", return_value=["unsupported-model-x"]
+        ):
+            catalog = models_mod._openai_catalog("openai-api", force_refresh=True)
+
+        assert catalog == curated
+        assert isinstance(catalog, models_mod.CuratedFallbackModels)
+
 
 class TestCuratedFallbackPreserved:
     def test_custom_proxy_keeps_curated_fallback(self):

@@ -1561,13 +1561,12 @@ def _openai_catalog(normalized: str, force_refresh: bool) -> Optional[list[str]]
         return live
     live_lower = {m.lower() for m in live}
     curated = list(_PROVIDER_MODELS.get(normalized, []))
-    # Curated order, only models the account has access to; an account serving none of them (rare)
-    # falls back to curated so the picker still offers sane defaults.
+    # Mark this fallback so cached consumers cannot mistake it for live data.
     discovered = [m for m in curated if m.lower() in live_lower]
     # Astra is intentionally absent from offline/static catalogs: the official API's
     # account-scoped /models response is the only source that may advertise it.
     discovered.extend(m for m in live if is_astra_model(m))
-    return discovered or curated or live
+    return discovered or CuratedFallbackModels(curated) or live
 
 
 def _custom_catalog(normalized: str, force_refresh: bool) -> Optional[list[str]]:
