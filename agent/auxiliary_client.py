@@ -1034,7 +1034,7 @@ def _select_pool_entry(provider: str, *, model: Optional[str] = None) -> Tuple[b
     if pool is None:
         return False, None
     try:
-        return True, pool.select(model=model)
+        return True, pool.select(model=model) if model is not None else pool.select()
     except Exception as exc:
         logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
         return True, None
