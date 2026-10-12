@@ -476,6 +476,22 @@ def test_usage_forced_refresh_keeps_the_refreshed_pool_key_on_the_gateway(monkey
 
 
 
+
+def test_unscoped_auxiliary_pool_selection_preserves_existing_signature(monkeypatch):
+    """Unrelated provider pools need not accept a Codex-specific model keyword."""
+    from agent import auxiliary_client as aux
+
+    entry = object()
+
+    class LegacyPool:
+        def select(self):
+            return entry
+
+    monkeypatch.setattr(aux, "_load_pool_with_credentials", lambda provider, note="": LegacyPool())
+    assert aux._select_pool_entry("anthropic") == (True, entry)
+
+
+
 def test_goal_judge_codex_pool_selection_respects_requested_model(monkeypatch):
     """A cooldown for a different model cannot suppress valid goal-judge credentials."""
     from agent import auxiliary_client as aux
