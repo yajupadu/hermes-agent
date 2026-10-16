@@ -304,7 +304,6 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
-    import shutil
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
     if event_days < 0 or log_days < 0:
@@ -335,7 +334,9 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         # completion, and rmtree refuses a symlink (so it must not be counted).
         if not path.is_dir() or path.is_symlink() or not kbw._is_managed_scratch_path(path):
             continue
-        shutil.rmtree(path, ignore_errors=True)
+        # P0: GC must not bypass completion's non-destructive scratch guard.
+        # Any nonempty archived-task scratch is atomically retained for recovery.
+        kbw._retain_managed_scratch(row["id"], path)
         if not path.exists():
             removed_ws += 1
 
