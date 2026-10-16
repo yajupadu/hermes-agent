@@ -171,8 +171,69 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
+def _retain_managed_scratch(task_id: str, workspace: Path) -> Optional[Path]:
+    """P0 containment: never destroy a nonempty managed scratch workspace.
+
+    A task can currently reach DONE without declaring changed source as an
+    attachment. Move nonempty workspaces to a task-independent retention area
+    atomically on the same filesystem instead of deleting their only source.
+    This is containment, NOT proof of artifact admission or a GC policy.
+    Unavailable/cross-device retention fails closed: leave the original intact.
+    """
+    if workspace.is_symlink() or not _is_managed_scratch_path(workspace):
+        return None
+    if not workspace.is_dir():
+        return None
+    try:
+        if not any(workspace.iterdir()):
+            workspace.rmdir()
+            return None
+        # Outside managed workspaces/ so later archive/GC sweeps cannot erase it.
+        root = _kb.kanban_home() / "kanban" / "retained-workspaces"
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if workspace.stat().st_dev != root.stat().st_dev:
+            _kb._log.warning(
+                "P0: preserving original scratch for %s (retention is cross-device): %s",
+                task_id, workspace,
+            )
+            return None
+        destination = root / f"{task_id}-{time.time_ns()}"
+        # Atomic rename avoids incomplete copies, disk amplification, and
+        # deletion after a failed persistence attempt. Never overwrite.
+        if destination.exists():
+            _kb._log.warning("P0: scratch retention destination already exists: %s", destination)
+            return None
+        workspace.rename(destination)
+        _kb._log.warning(
+            "P0: retained nonempty scratch for task %s at %s; source admission NOT verified",
+            task_id, destination,
+        )
+        return destination
+    except OSError:
+        _kb._log.exception("P0: scratch preservation failed; keeping original %s", workspace)
+        return None
+
+
+def _record_retained_workspace(
+    conn: sqlite3.Connection, task_id: str, destination: Optional[Path],
+) -> None:
+    if destination is None:
+        return
+    try:
+        with _kb.write_txn(conn):
+            _kb._append_event(
+                conn, task_id, "scratch_workspace_retained",
+                {"path": str(destination), "source_admission": "unverified"},
+            )
+    except Exception:
+        _kb._log.exception(
+            "P0: retained workspace %s but could not record event for task %s",
+            destination, task_id,
+        )
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
-    """Remove a task's scratch workspace dir and kill its stale tmux session.
+    """Retain nonempty scratch workspaces and kill stale worker tmux sessions.
     Called from :func:`complete_task` after the transaction commits; best-effort
     so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
     only when provably free of work (clean tree, every commit reachable from a
@@ -213,8 +274,9 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # See #28818.
             if _is_managed_scratch_path(wp):
                 release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Removed scratch workspace: %s", wp)
+                _record_retained_workspace(
+                    conn, task_id, _retain_managed_scratch(task_id, wp),
+                )
             else:
                 _kb._log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
@@ -332,8 +394,9 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
                 release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                _record_retained_workspace(
+                    conn, parent_id, _retain_managed_scratch(parent_id, wp),
+                )
     except Exception:
         pass  # best-effort
 
