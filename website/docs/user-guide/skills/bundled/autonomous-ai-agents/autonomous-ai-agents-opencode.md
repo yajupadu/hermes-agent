@@ -173,11 +173,98 @@ OpenCode has a built-in PR command:
 terminal(command="opencode pr 42", workdir="~/project", pty=true)
 ```
 
-Or review in a temporary clone for isolation:
+Do not use a full clone for PR review. From an existing local checkout of the
+same repository, fetch the PR head and base into unique temporary refs, resolve
+both to commit OIDs, and create a unique detached linked worktree at the pinned
+head OID. Run the reviewer there against the pinned base OID, then explicitly
+remove the worktree and temporary refs. If no local object store is available,
+stop and ask an operator to provision a bounded review source; do not clone.
 
+Run this as a single `terminal` call (`pty=true`) in its own `bash` process
+(save it to a scratch script and run `bash <script>`, so `set -eu`, `cd` and the
+cleanup trap do not leak into the session shell). Set `REPO`, `PR` and `BASE_BRANCH` first; `REPO` must already
+be a checkout of the same repository (the fetch only transfers objects it is
+missing, and uses GitHub's `refs/pull/<n>/head`).
+
+```bash
+set -eu
+REPO="$HOME/project"   # existing local checkout of the SAME repository
+PR=42
+BASE_BRANCH=main
+REMOTE=origin
+
+# No local object store -> stop here; do not clone.
+git -C "$REPO" rev-parse --git-dir >/dev/null || {
+  echo "no local object store: ask an operator to provision a bounded review source" >&2
+  exit 2
+}
+echo "fetching from: $(git -C "$REPO" remote get-url "$REMOTE")"
+
+# Fail closed on the file bound: a positive integer of at most 500, default 20.
+MAX_FILES=${MAX_FILES:-20}
+if ! [[ "$MAX_FILES" =~ ^[1-9][0-9]{0,2}$ ]] || [ "$MAX_FILES" -gt 500 ]; then
+  echo "MAX_FILES must be an integer from 1 to 500 (got: $MAX_FILES)" >&2
+  exit 2
+fi
+
+# Unique worktree directory and unique temporary refs (never refs/heads, refs/remotes, refs/pull).
+WT=$(mktemp -d "${TMPDIR:?set TMPDIR to the Hermes scratch dir}/pr-review.XXXXXX")
+ID=${WT##*/}
+HEAD_REF=refs/hermes-review/$ID/head
+BASE_REF=refs/hermes-review/$ID/base
+
+# Refuse collisions and compare-and-delete so cleanup cannot remove another run’s refs.
+HEAD_REF_OID=
+BASE_REF_OID=
+cleanup() {
+  # No --force: git refuses to remove a dirty/untracked worktree, so reviewer output is never destroyed.
+  git -C "$REPO" worktree remove "$WT" 2>/dev/null || { [ ! -e "$WT" ] || echo "preserved dirty review worktree: $WT" >&2; }
+  rmdir "$WT" 2>/dev/null || true
+  [ -z "$HEAD_REF_OID" ] || git -C "$REPO" update-ref -d "$HEAD_REF" "$HEAD_REF_OID" 2>/dev/null || true
+  [ -z "$BASE_REF_OID" ] || git -C "$REPO" update-ref -d "$BASE_REF" "$BASE_REF_OID" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+if git -C "$REPO" show-ref --verify --quiet "$HEAD_REF" ||
+   git -C "$REPO" show-ref --verify --quiet "$BASE_REF"; then
+  echo "temporary review ref already exists; choose a fresh scratch path and retry" >&2
+  exit 2
+fi
+
+git -C "$REPO" -c gc.auto=0 -c maintenance.auto=false fetch --atomic --no-tags \
+  --no-write-fetch-head --no-recurse-submodules "$REMOTE" \
+  "refs/pull/$PR/head:$HEAD_REF" "refs/heads/$BASE_BRANCH:$BASE_REF"
+
+# Record each fetched ref's raw OID as soon as it exists, so cleanup can
+# compare-and-delete exactly the refs this run created even if validation fails.
+HEAD_REF_OID=$(git -C "$REPO" rev-parse --verify "$HEAD_REF")
+BASE_REF_OID=$(git -C "$REPO" rev-parse --verify "$BASE_REF")
+# Pin: peel each to a commit OID; worktree and diff use only these commit OIDs.
+HEAD_OID=$(git -C "$REPO" rev-parse --verify --quiet "$HEAD_REF_OID^{commit}") ||
+  { echo "PR head $HEAD_REF_OID is not a commit; nothing was reviewed" >&2; exit 2; }
+BASE_OID=$(git -C "$REPO" rev-parse --verify --quiet "$BASE_REF_OID^{commit}") ||
+  { echo "base $BASE_REF_OID is not a commit; nothing was reviewed" >&2; exit 2; }
+
+git -C "$REPO" worktree add --detach "$WT" "$HEAD_OID"
+cd "$WT"
+# Fail now if the diff cannot be computed (a failure inside <(...) below would be silent).
+git diff --name-only -z "$BASE_OID...$HEAD_OID" >/dev/null
+FILE_ARGS=()
+file_count=0
+while IFS= read -r -d '' file; do
+  if [ "$file_count" -ge "$MAX_FILES" ]; then
+    echo "PR changes more than $MAX_FILES files; refusing a partial review (raise MAX_FILES or review in chunks)" >&2
+    exit 2
+  fi
+  FILE_ARGS+=(-f "$file")
+  file_count=$((file_count + 1))
+done < <(git diff --name-only -z "$BASE_OID...$HEAD_OID")
+opencode run "Review this PR against $BASE_OID (git diff $BASE_OID...$HEAD_OID). Report bugs, security risks, test gaps, and style issues." ${FILE_ARGS[@]+"${FILE_ARGS[@]}"}
 ```
-terminal(command="REVIEW=$(mktemp -d) && git clone https://github.com/user/repo.git $REVIEW && cd $REVIEW && opencode run 'Review this PR vs main. Report bugs, security risks, test gaps, and style issues.' -f $(git diff origin/main --name-only | head -20 | tr '\n' ' ')", pty=true)
-```
+
+Afterwards, `git -C "$REPO" worktree list` and `git -C "$REPO" for-each-ref
+refs/hermes-review/` should no longer show this run's worktree or refs.
 
 ## Parallel Work Pattern
 
