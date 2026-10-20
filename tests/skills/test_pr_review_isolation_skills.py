@@ -98,7 +98,7 @@ def test_recipe_uses_unique_refs_pinned_oids_and_explicit_cleanup(rel):
     assert 'WT=$(mktemp -d "${TMPDIR:?' in script
     assert "HEAD_REF=refs/hermes-review/$ID/head" in script
     assert "BASE_REF=refs/hermes-review/$ID/base" in script
-    fetch = script[script.index("fetch "):script.index("# Pin both commits")]
+    fetch = script[script.index("fetch "):script.index("# Record each fetched ref")]
     assert '"refs/pull/$PR/head:$HEAD_REF"' in fetch
     assert '"refs/heads/$BASE_BRANCH:$BASE_REF"' in fetch
     assert "--atomic" in fetch, "fetch must not leave partial ref updates on failure"
@@ -108,8 +108,18 @@ def test_recipe_uses_unique_refs_pinned_oids_and_explicit_cleanup(rel):
     assert not re.search(r'(?<![\w/])refs/remotes/|refs/heads/pr', fetch)
 
     # OIDs are pinned, the worktree is detached at the pinned head, review is against the base OID.
-    assert 'HEAD_OID=$(git -C "$REPO" rev-parse --verify "$HEAD_REF^{commit}")' in script
-    assert 'BASE_OID=$(git -C "$REPO" rev-parse --verify "$BASE_REF^{commit}")' in script
+    # The raw ref OIDs are recorded *before* commit peeling so cleanup can always
+    # compare-and-delete the refs this run created, even when validation fails.
+    head_assign = 'HEAD_REF_OID=$(git -C "$REPO" rev-parse --verify "$HEAD_REF")'
+    base_assign = 'BASE_REF_OID=$(git -C "$REPO" rev-parse --verify "$BASE_REF")'
+    head_check = 'HEAD_OID=$(git -C "$REPO" rev-parse --verify --quiet "$HEAD_REF_OID^{commit}")'
+    base_check = 'BASE_OID=$(git -C "$REPO" rev-parse --verify --quiet "$BASE_REF_OID^{commit}")'
+    for needle in (head_assign, base_assign, head_check, base_check):
+        assert needle in script, needle
+    assert script.index(head_assign) < script.index(head_check)
+    assert script.index(base_assign) < script.index(base_check)
+    assert script.index(base_check) < script.index("worktree add")
+    assert '"$HEAD_REF^{commit}"' not in script and '"$BASE_REF^{commit}"' not in script
     assert 'git -C "$REPO" worktree add --detach "$WT" "$HEAD_OID"' in script
     assert "$BASE_OID" in script.split('worktree add --detach "$WT" "$HEAD_OID"', 1)[1]
 
@@ -119,8 +129,12 @@ def test_recipe_uses_unique_refs_pinned_oids_and_explicit_cleanup(rel):
     assert "worktree remove --force" not in script, "dirty worktrees must be preserved, never force-removed"
     assert "preserved" in script
     assert "show-ref --verify --quiet \"$HEAD_REF\"" in script
-    assert 'update-ref -d "$HEAD_REF" "$HEAD_OID"' in script
-    assert 'update-ref -d "$BASE_REF" "$BASE_OID"' in script
+    # Cleanup compare-and-deletes the *raw* ref OIDs recorded right after fetch (not the peeled
+    # commit OIDs), so it removes exactly the refs this run created even if commit peeling failed.
+    assert 'update-ref -d "$HEAD_REF" "$HEAD_REF_OID"' in script
+    assert 'update-ref -d "$BASE_REF" "$BASE_REF_OID"' in script
+    assert 'update-ref -d "$HEAD_REF" "$HEAD_OID"' not in script
+    assert 'update-ref -d "$BASE_REF" "$BASE_OID"' not in script
     for destructive in ("rm -rf", "git clean", "git reset", "git gc", "prune", "branch -D", "--force-with"):
         assert destructive not in script, destructive
 
@@ -335,3 +349,75 @@ def test_recipe_preserves_colliding_preexisting_ref_when_fetch_fails(rel, scenar
     assert not log.exists(), "reviewer must not run after a ref collision"
     assert _state(local, env) == (refs_before, wts_before)
     assert not list((scenario["root"] / "scratch").iterdir())
+
+
+def _push_pr_ref(scenario: dict, number: int, files: int) -> None:
+    """Add refs/pull/<number>/head to the fake origin: base + one commit touching ``files`` files."""
+    root, env, base = scenario["root"], scenario["env"], scenario["base"]
+    work = root / f"work-{number}"
+    work.mkdir()
+    _git(work, "init", "-b", "main", env=env)
+    _git(work, "fetch", str(root / "origin.git"), base, env=env)
+    _git(work, "checkout", "-q", "--detach", "FETCH_HEAD", env=env)
+    for i in range(files):
+        (work / f"f{i:02d}.txt").write_text(f"{i}\n")
+    _git(work, "add", ".", env=env)
+    _git(work, "commit", "-m", f"touch {files}", env=env)
+    _git(work, "push", str(root / "origin.git"), f"HEAD:refs/pull/{number}/head", env=env)
+
+
+@_posix
+@pytest.mark.parametrize("rel", sorted(REVIEW_SKILLS))
+def test_recipe_cleans_refs_when_commit_validation_fails(rel, scenario):
+    """A PR ref that resolves to a non-commit must fail loudly and still delete the fetched refs."""
+    local, env, root = scenario["local"], scenario["env"], scenario["root"]
+    origin = root / "origin.git"
+    blob = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"], cwd=origin, env=env, input="not a commit\n",
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    _git(origin, "update-ref", "refs/pull/77/head", blob, env=env)
+    refs_before, wts_before = _state(local, env)
+
+    proc, log = _run_recipe(rel, scenario, pr="77")
+
+    assert proc.returncode == 2, proc.stderr
+    assert "is not a commit" in proc.stderr and "nothing was reviewed" in proc.stderr
+    assert not log.exists(), "reviewer must not run"
+    assert _git(local, "for-each-ref", "refs/hermes-review/", env=env) == "", "fetched refs must not leak"
+    assert _state(local, env) == (refs_before, wts_before)
+    assert not list((root / "scratch").iterdir())
+
+
+@_posix
+def test_opencode_fails_explicitly_instead_of_silently_truncating_large_diffs(scenario):
+    rel = "skills/autonomous-ai-agents/opencode/SKILL.md"
+    local, env, root = scenario["local"], scenario["env"], scenario["root"]
+    _push_pr_ref(scenario, 88, files=21)
+    refs_before, wts_before = _state(local, env)
+
+    proc, log = _run_recipe(rel, scenario, pr="88")
+
+    assert proc.returncode == 2, proc.stderr
+    assert "more than 20 files" in proc.stderr and "refusing a partial review" in proc.stderr
+    assert not log.exists(), "a partial review must never be started"
+    assert _state(local, env) == (refs_before, wts_before)
+    assert not list((root / "scratch").iterdir())
+
+
+@_posix
+def test_opencode_reviews_every_file_at_the_bound(scenario):
+    rel = "skills/autonomous-ai-agents/opencode/SKILL.md"
+    _push_pr_ref(scenario, 89, files=20)
+    proc, log = _run_recipe(rel, scenario, pr="89")
+    assert proc.returncode == 0, proc.stderr
+    assert log.read_text().count("arg=<-f>") == 20
+
+
+@_posix
+def test_opencode_max_files_override_raises_the_bound(scenario):
+    rel = "skills/autonomous-ai-agents/opencode/SKILL.md"
+    _push_pr_ref(scenario, 90, files=21)
+    proc, log = _run_recipe(rel, scenario, pr="90", extra_env={"MAX_FILES": "25"})
+    assert proc.returncode == 0, proc.stderr
+    assert log.read_text().count("arg=<-f>") == 21

@@ -151,14 +151,14 @@ HEAD_REF=refs/hermes-review/$ID/head
 BASE_REF=refs/hermes-review/$ID/base
 
 # Refuse collisions and compare-and-delete so cleanup cannot remove another run’s refs.
-HEAD_OID=
-BASE_OID=
+HEAD_REF_OID=
+BASE_REF_OID=
 cleanup() {
   # No --force: git refuses to remove a dirty/untracked worktree, so reviewer output is never destroyed.
   git -C "$REPO" worktree remove "$WT" 2>/dev/null || { [ ! -e "$WT" ] || echo "preserved dirty review worktree: $WT" >&2; }
   rmdir "$WT" 2>/dev/null || true
-  [ -z "$HEAD_OID" ] || git -C "$REPO" update-ref -d "$HEAD_REF" "$HEAD_OID" 2>/dev/null || true
-  [ -z "$BASE_OID" ] || git -C "$REPO" update-ref -d "$BASE_REF" "$BASE_OID" 2>/dev/null || true
+  [ -z "$HEAD_REF_OID" ] || git -C "$REPO" update-ref -d "$HEAD_REF" "$HEAD_REF_OID" 2>/dev/null || true
+  [ -z "$BASE_REF_OID" ] || git -C "$REPO" update-ref -d "$BASE_REF" "$BASE_REF_OID" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -173,9 +173,15 @@ git -C "$REPO" -c gc.auto=0 -c maintenance.auto=false fetch --atomic --no-tags \
   --no-write-fetch-head --no-recurse-submodules "$REMOTE" \
   "refs/pull/$PR/head:$HEAD_REF" "refs/heads/$BASE_BRANCH:$BASE_REF"
 
-# Pin both commits; everything below uses the OIDs, not the refs.
-HEAD_OID=$(git -C "$REPO" rev-parse --verify "$HEAD_REF^{commit}")
-BASE_OID=$(git -C "$REPO" rev-parse --verify "$BASE_REF^{commit}")
+# Record each fetched ref's raw OID as soon as it exists, so cleanup can
+# compare-and-delete exactly the refs this run created even if validation fails.
+HEAD_REF_OID=$(git -C "$REPO" rev-parse --verify "$HEAD_REF")
+BASE_REF_OID=$(git -C "$REPO" rev-parse --verify "$BASE_REF")
+# Pin: peel each to a commit OID; worktree and diff use only these commit OIDs.
+HEAD_OID=$(git -C "$REPO" rev-parse --verify --quiet "$HEAD_REF_OID^{commit}") ||
+  { echo "PR head $HEAD_REF_OID is not a commit; nothing was reviewed" >&2; exit 2; }
+BASE_OID=$(git -C "$REPO" rev-parse --verify --quiet "$BASE_REF_OID^{commit}") ||
+  { echo "base $BASE_REF_OID is not a commit; nothing was reviewed" >&2; exit 2; }
 
 git -C "$REPO" worktree add --detach "$WT" "$HEAD_OID"
 cd "$WT"
