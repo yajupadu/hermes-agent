@@ -97,11 +97,73 @@ During an interactive session, use these commands:
 
 ## PR Reviews
 
-Clone to a temp directory to avoid modifying the working tree:
+Do not use a full clone for PR review. From an existing local checkout of the
+same repository, fetch the PR head and base into unique temporary refs, pin
+their resolved commit OIDs, and create a unique detached linked worktree at the
+pinned head. Run Blackbox there against the pinned base OID, then explicitly
+remove the worktree and temporary refs. If no local object store is available,
+stop and ask an operator to provision a bounded review source; do not clone.
 
+Run this as a single `terminal` call (`pty=true`) in its own `bash` process
+(save it to a scratch script and run `bash <script>`, so `set -eu`, `cd` and the
+cleanup trap do not leak into the session shell). Set `REPO`, `PR` and `BASE_BRANCH` first; `REPO` must already
+be a checkout of the same repository (the fetch only transfers objects it is
+missing, and uses GitHub's `refs/pull/<n>/head`).
+
+```bash
+set -eu
+REPO="$HOME/project"   # existing local checkout of the SAME repository
+PR=42
+BASE_BRANCH=main
+REMOTE=origin
+
+# No local object store -> stop here; do not clone.
+git -C "$REPO" rev-parse --git-dir >/dev/null || {
+  echo "no local object store: ask an operator to provision a bounded review source" >&2
+  exit 2
+}
+echo "fetching from: $(git -C "$REPO" remote get-url "$REMOTE")"
+
+# Unique worktree directory and unique temporary refs (never refs/heads, refs/remotes, refs/pull).
+WT=$(mktemp -d "${TMPDIR:?set TMPDIR to the Hermes scratch dir}/pr-review.XXXXXX")
+ID=${WT##*/}
+HEAD_REF=refs/hermes-review/$ID/head
+BASE_REF=refs/hermes-review/$ID/base
+
+# Refuse collisions and compare-and-delete so cleanup cannot remove another run’s refs.
+HEAD_OID=
+BASE_OID=
+cleanup() {
+  # No --force: git refuses to remove a dirty/untracked worktree, so reviewer output is never destroyed.
+  git -C "$REPO" worktree remove "$WT" 2>/dev/null || { [ ! -e "$WT" ] || echo "preserved dirty review worktree: $WT" >&2; }
+  rmdir "$WT" 2>/dev/null || true
+  [ -z "$HEAD_OID" ] || git -C "$REPO" update-ref -d "$HEAD_REF" "$HEAD_OID" 2>/dev/null || true
+  [ -z "$BASE_OID" ] || git -C "$REPO" update-ref -d "$BASE_REF" "$BASE_OID" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+if git -C "$REPO" show-ref --verify --quiet "$HEAD_REF" ||
+   git -C "$REPO" show-ref --verify --quiet "$BASE_REF"; then
+  echo "temporary review ref already exists; choose a fresh scratch path and retry" >&2
+  exit 2
+fi
+
+git -C "$REPO" -c gc.auto=0 -c maintenance.auto=false fetch --atomic --no-tags \
+  --no-write-fetch-head --no-recurse-submodules "$REMOTE" \
+  "refs/pull/$PR/head:$HEAD_REF" "refs/heads/$BASE_BRANCH:$BASE_REF"
+
+# Pin both commits; everything below uses the OIDs, not the refs.
+HEAD_OID=$(git -C "$REPO" rev-parse --verify "$HEAD_REF^{commit}")
+BASE_OID=$(git -C "$REPO" rev-parse --verify "$BASE_REF^{commit}")
+
+git -C "$REPO" worktree add --detach "$WT" "$HEAD_OID"
+cd "$WT"
+blackbox --prompt "Review this PR against $BASE_OID (git diff $BASE_OID...$HEAD_OID). Check for bugs, security issues, and code quality."
 ```
-terminal(command="REVIEW=$(mktemp -d) && git clone https://github.com/user/repo.git $REVIEW && cd $REVIEW && gh pr checkout 42 && blackbox --prompt 'Review this PR against main. Check for bugs, security issues, and code quality.'", pty=true)
-```
+
+Afterwards, `git -C "$REPO" worktree list` and `git -C "$REPO" for-each-ref
+refs/hermes-review/` should no longer show this run's worktree or refs.
 
 ## Parallel Work
 
