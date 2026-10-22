@@ -1762,11 +1762,19 @@ def dispatch_profile_allowlist_summary() -> str:
 
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
-        (status,),
-    ).fetchall()
+    if status == "review":
+        rows = conn.execute(
+            "SELECT DISTINCT t.assignee FROM tasks t "
+            "JOIN task_review_auto_grants g ON g.task_id = t.id "
+            "WHERE t.status = 'review' AND t.assignee IS NOT NULL "
+            "AND t.claim_lock IS NULL",
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT DISTINCT assignee FROM tasks "
+            "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
+            (status,),
+        ).fetchall()
     if not rows:
         return False
     profile_exists = _profile_exists_fn()
