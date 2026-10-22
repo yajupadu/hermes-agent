@@ -1396,6 +1396,11 @@ def run_slash(rest: str) -> str:
     stdout/stderr. Shared by the interactive CLI and the gateway so formatting is identical."""
     import io
 
+    # Human-authorization changes are deliberately unavailable to agents
+    # through the /kanban slash interface. They require a direct CLI invocation.
+    if rest.lstrip().split(None, 1)[0:1] == ["review-auto"]:
+        return "review-auto must be run directly in an interactive operator terminal."
+
     # Non-posix split (Windows) keeps backslashes as path separators but
     # leaves quote characters in the tokens — strip a fully wrapping pair
     # so `"my task"` reaches argparse as `my task`, not `"my task"`.
