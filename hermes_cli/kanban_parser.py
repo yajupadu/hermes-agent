@@ -368,6 +368,9 @@ _SPECS = [
     ], help="Archive one or more tasks"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
+        _arg("--ready-id", action="append", dest="ready_ids", metavar="TASK_ID",
+             help="Atomically dispatch ONLY these exact READY task IDs; "
+                  "never admit or reserve REVIEW tasks (repeatable)."),
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
         _arg("--max", type=int, help="Cap number of spawns this pass"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT,
