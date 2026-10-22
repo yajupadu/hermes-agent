@@ -209,7 +209,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "review-auto",
     "gc",
 })
 
@@ -1055,6 +1055,30 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_review_auto(args: argparse.Namespace) -> int:
+    """Human-operated durable REVIEW authorization, never a worker handoff."""
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
+    if (os.environ.get("HERMES_KANBAN_TASK")
+            or is_dispatcher_owned_worker_context()
+            or not sys.stdin.isatty()):
+        return _err(
+            "review-auto requires a direct interactive operator terminal; "
+            "workers and unattended automation cannot authorize themselves"
+        )
+    reason = str(args.reason or "").strip()
+    if not reason:
+        return _err("--reason cannot be empty")
+    with kbc.connect_closing() as conn:
+        if not kb.set_review_auto_authorization(
+            conn, args.task_id, enabled=args.decision == "allow",
+            authorized_by=_profile_author(), reason=reason,
+        ):
+            return _err("task not found, done, or archived")
+    print(f"Automatic review {args.decision} recorded for {args.task_id}")
+    return 0
+
+
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
@@ -1327,7 +1351,8 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
-    "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+    "request-review": _cmd_request_review, "review-auto": _cmd_review_auto,
+    "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
