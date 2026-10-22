@@ -975,6 +975,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_recurrences    INTEGER NOT NULL DEFAULT 0
 );
 
+-- Per-task opt-in for unattended REVIEW claims. Absence is a deliberate
+-- human-review hold on both legacy and newly created tasks. A global
+-- review_dispatch flag is NOT approval for a particular task.
+CREATE TABLE IF NOT EXISTS task_review_auto_grants (
+    task_id TEXT PRIMARY KEY,
+    authorized_by TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    authorized_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
@@ -2222,6 +2232,7 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
@@ -2235,8 +2246,8 @@ def _claim_and_open_run(
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
-        """,
-        (lock, expires, now, task_id),
+        """ + (" AND assignee = ?" if expected_assignee is not None else ""),
+        (lock, expires, now, task_id, *((expected_assignee,) if expected_assignee is not None else ())),
     )
     if cur.rowcount != 1:
         return None
@@ -2266,9 +2277,61 @@ def _claim_and_open_run(
     return run_id
 
 
+def review_auto_authorized(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Only an explicit durable per-task authorization permits automatic review.
+
+    Fail closed for legacy rows and unknown task IDs. A stale snapshot is not
+    sufficient: unattended callers recheck this inside the claim transaction.
+    """
+    return conn.execute(
+        "SELECT 1 FROM task_review_auto_grants WHERE task_id = ?", (task_id,),
+    ).fetchone() is not None
+
+
+def set_review_auto_authorization(
+    conn: sqlite3.Connection, task_id: str, *, enabled: bool,
+    authorized_by: str, reason: str,
+) -> bool:
+    """Record/revoke the operator's explicit per-task automatic review decision.
+
+    Caller MUST enforce its trusted-operator boundary; this DB API cannot
+    authenticate a human when invoked directly from an arbitrary Python shell.
+    Neither worker review_requested metadata nor reviewer profile is authority.
+    """
+    actor, why = str(authorized_by or "").strip(), str(reason or "").strip()
+    if not actor or not why:
+        raise ValueError("authorized_by and reason are required")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] in ("done", "archived"):
+            return False
+        if enabled:
+            conn.execute(
+                "INSERT INTO task_review_auto_grants "
+                "(task_id, authorized_by, reason, authorized_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET "
+                "authorized_by=excluded.authorized_by, "
+                "reason=excluded.reason, authorized_at=excluded.authorized_at",
+                (task_id, actor, why, int(time.time())),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM task_review_auto_grants WHERE task_id = ?",
+                (task_id,),
+            )
+        _append_event(
+            conn, task_id, "review_auto_authorization",
+            {"enabled": bool(enabled), "authorized_by": actor, "reason": why},
+        )
+    return True
+
+
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2293,7 +2356,10 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        run_id = _claim_and_open_run(
+            conn, task_id, "ready", lock, expires, now,
+            expected_assignee=expected_assignee,
+        )
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
@@ -2303,7 +2369,8 @@ def claim_task(
 
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, automated: bool = False,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -2312,6 +2379,10 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Unattended review requires durable task-specific authority checked
+        # inside the same SQLite writer transaction as the status CAS.
+        if automated and not review_auto_authorized(conn, task_id):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2324,7 +2395,9 @@ def claim_review_task(
                 )
             return None
         run_id = _claim_and_open_run(
-            conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
+            conn, task_id, "review", lock, expires, now,
+            event_extra={"source_status": "review"},
+            expected_assignee=expected_assignee,
         )
         if run_id is None:
             return None

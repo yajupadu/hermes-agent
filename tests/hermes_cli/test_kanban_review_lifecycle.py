@@ -398,6 +398,10 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.get_task(conn, tid).status == "review"
+        assert kb.set_review_auto_authorization(
+            conn, tid, enabled=True, authorized_by="test-operator",
+            reason="exercise explicitly permitted automatic-review global gate",
+        )
 
         # The assignee profile is spawnable — so ONLY the gate can stop the
         # review-column dispatch from claiming it.
@@ -452,6 +456,10 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert kb.request_review(
             conn, review_id, summary="PR ready",
             expected_run_id=claimed.current_run_id,
+        )
+        assert kb.set_review_auto_authorization(
+            conn, review_id, enabled=True, authorized_by="test-operator",
+            reason="exercise explicitly approved PR-review dispatch",
         )
         # Ready-lane task with the same fresh PR comment.
         ready_id = kb.create_task(conn, title="already PRed", assignee="worker")
@@ -666,6 +674,10 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
             summary="ready",
             expected_run_id=implementation.current_run_id,
         )
+        assert kb.set_review_auto_authorization(
+            conn, task_id, enabled=True, authorized_by="test-operator",
+            reason="exercise explicitly approved sdlc-review skill dispatch",
+        )
         monkeypatch.setattr(
             kbd,
             "check_respawn_guard",
@@ -714,6 +726,10 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
                 task_id,
                 summary="ready",
                 expected_run_id=implementation.current_run_id,
+            )
+            assert kb.set_review_auto_authorization(
+                conn, task_id, enabled=True, authorized_by="test-operator",
+                reason="exercise explicitly permitted review concurrency caps",
             )
             review_ids.append(task_id)
 
