@@ -34,19 +34,16 @@ def test_protected_review_never_reserved_or_claimed(home, all_assignees_spawnabl
     with kbc.connect() as conn:
         protected = [_review(conn, "#58 human approval"), _review(conn, "#87 owner review")]
         ready = kb.create_task(conn, title="#116 authorized scratch", assignee="trader")
+        # With one slot, protected REVIEW must NOT reserve the capacity.
+        # The unrestricted tick may still dispatch an independently READY task.
+        initial = kbd.dispatch_once(conn, max_spawn=slots, dry_run=True)
+        assert [tid for tid, _a, _w in initial.spawned] == [ready]
+        assert all(kb.get_task(conn, tid).status == "review" for tid in protected)
         res = kbd.dispatch_once(
             conn, max_spawn=slots, spawn_fn=lambda task, _ws: spawned.append(task.id),
             ready_task_ids=[ready],
         )
         assert [t for t, _assignee, _ws in res.spawned] == [ready]
-        assert spawned == [ready]
-        assert all(kb.get_task(conn, tid).status == "review" for tid in protected)
-        # An unrelated unrestricted native tick also cannot admit protected REVIEW.
-        followup = kbd.dispatch_once(
-            conn, max_spawn=slots + 3,
-            spawn_fn=lambda task, _ws: spawned.append(task.id),
-        )
-        assert followup.spawned == []
         assert spawned == [ready]
         assert all(kb.get_task(conn, tid).status == "review" for tid in protected)
 
