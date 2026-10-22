@@ -1964,6 +1964,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    ready_task_ids: Optional[Iterable[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1987,6 +1988,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            ready_task_ids=ready_task_ids,
         )
 
     try:
@@ -2095,8 +2097,18 @@ def _dispatch_lane_task(
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
         return True
-    claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    # Bind the row's effective assignee at claim time. A CLI reassignment
+    # after the lane snapshot must not redirect a claimed worker silently.
+    if lane == "review":
+        claimed = _kb.claim_review_task(
+            conn, task_id, ttl_seconds=ttl_seconds,
+            automated=True, expected_assignee=assignee,
+        )
+    else:
+        claimed = _kb.claim_task(
+            conn, task_id, ttl_seconds=ttl_seconds,
+            expected_assignee=assignee,
+        )
     if claimed is None:
         return False
     try:
@@ -2339,6 +2351,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    ready_task_ids: Optional[Iterable[str]] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2357,9 +2370,25 @@ def _dispatch_once_locked(
         return result
 
     ready_rows = _lane_rows(conn, "ready")
-    # Review rows are enumerated up front so the budget split can see whether
-    # review work exists at all.
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    if ready_task_ids is not None:
+        # Explicit selective admission MUST NOT inspect/claim/reserve REVIEW
+        # capacity. Accept only exact IDs, never task-title matches or prefixes.
+        requested = tuple(ready_task_ids)
+        if not all(isinstance(tid, str) and tid for tid in requested):
+            raise ValueError("ready_task_ids must contain nonempty task-ID strings")
+        allowed = frozenset(requested)
+        ready_rows = [row for row in ready_rows if row["id"] in allowed]
+        review_rows = []
+    else:
+        # Ordinary ticks also fail closed on REVIEW rows with no explicit
+        # durable per-task auto-review authorization. Selecting fewer rows
+        # before reservation prevents a human-gated REVIEW card from
+        # starving an unrelated authorized READY card.
+        review_rows = (
+            [row for row in _lane_rows(conn, "review")
+             if _kb.review_auto_authorized(conn, row["id"])]
+            if review_dispatch_enabled() else []
+        )
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which
