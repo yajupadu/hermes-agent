@@ -1221,8 +1221,9 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
+    # Fast-path idempotency lookup; it is only an optimization. Two creators
+    # can both miss this unlocked read, so the write transaction must recheck
+    # the same key before inserting a task.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -1248,6 +1249,19 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                # Serialize concurrent creators across DB connections/processes.
+                # write_txn obtains the SQLite write lock; no other creator can
+                # insert the same logical non-archived card between this lookup
+                # and our INSERT. Preserve existing archived-key reuse semantics.
+                if idempotency_key:
+                    existing = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if existing:
+                        return existing["id"]
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
